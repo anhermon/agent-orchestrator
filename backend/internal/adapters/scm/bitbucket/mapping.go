@@ -261,20 +261,29 @@ func checkStatus(state string) domain.PRCheckStatus {
 	}
 }
 
-// ciObservation builds the CI rollup from statuses sorted newest first. Bitbucket
-// keeps every update of a status key, so only the first (latest) per key counts.
+// ciObservation builds the CI rollup from statuses in any order. Bitbucket
+// keeps every update of a status key, so only the latest per key counts.
 func ciObservation(headSHA string, statuses []bbStatus) ports.SCMCIObservation {
 	if len(statuses) == 0 {
 		return ports.SCMCIObservation{Summary: string(domain.CIUnknown), HeadSHA: headSHA}
 	}
-	seen := map[string]struct{}{}
+	// Pick the latest update per key by updated_on rather than trusting the
+	// server's sort; keys stay in first-seen order and ties keep the first.
+	latest := map[string]bbStatus{}
+	var keys []string
+	for _, s := range statuses {
+		cur, seen := latest[s.Key]
+		if !seen {
+			keys = append(keys, s.Key)
+		}
+		if !seen || s.UpdatedOn.After(cur.UpdatedOn) {
+			latest[s.Key] = s
+		}
+	}
 	var checks, failed []ports.SCMCheckObservation
 	allPassed, anyFailed, anyPending := true, false, false
-	for _, s := range statuses {
-		if _, dup := seen[s.Key]; dup {
-			continue
-		}
-		seen[s.Key] = struct{}{}
+	for _, key := range keys {
+		s := latest[key]
 		status := checkStatus(s.State)
 		name := s.Name
 		if name == "" {
@@ -367,7 +376,10 @@ func commentObservation(c *bbComment) ports.SCMReviewCommentObservation {
 
 // buildThreads groups comments into threads: a root is a comment without a
 // parent and replies attach to their root, in API order. Deleted comments are
-// skipped, and replies whose root was deleted or is absent are dropped with it.
+// never emitted. A live reply whose root was deleted is kept: the deleted root
+// stays as a placeholder that supplies the thread's id, path, line and
+// resolution but contributes no comment. Replies whose root is absent from the
+// listing are dropped.
 func buildThreads(comments []bbComment) []ports.SCMReviewThreadObservation {
 	byID := make(map[int]*bbComment, len(comments))
 	for i := range comments {
@@ -397,7 +409,7 @@ func buildThreads(comments []bbComment) []ports.SCMReviewThreadObservation {
 			continue
 		}
 		root := rootOf(c)
-		if root == nil || root.Deleted {
+		if root == nil {
 			continue
 		}
 		th, ok := threads[root.ID]

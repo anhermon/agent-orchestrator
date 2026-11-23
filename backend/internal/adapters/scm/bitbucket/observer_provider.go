@@ -31,13 +31,24 @@ func (p *Provider) ListPRsByRepo(ctx context.Context, repo ports.SCMRepo, update
 	if !updatedAfter.IsZero() {
 		q.Set("q", fmt.Sprintf(`updated_on > "%s"`, updatedAfter.UTC().Format(time.RFC3339Nano)))
 	}
+	// A PR updated while paging can show up on two pages; keep the entry with
+	// the latest updated_on, at its first position.
 	var result []ports.SCMPRObservation
+	index := map[int]int{}
 	err := p.client.paginate(ctx, repoAPIPath(repo)+"/pullrequests", q, func(raw jsonRaw) error {
 		var pr bbPullRequest
 		if err := unmarshal(raw, &pr); err != nil {
 			return fmt.Errorf("bitbucket scm: decode PR list entry: %w", err)
 		}
-		result = append(result, prToObservation(repo, &pr))
+		obs := prToObservation(repo, &pr)
+		if i, dup := index[pr.ID]; dup {
+			if obs.UpdatedAtProvider.After(result[i].UpdatedAtProvider) {
+				result[i] = obs
+			}
+			return nil
+		}
+		index[pr.ID] = len(result)
+		result = append(result, obs)
 		return nil
 	})
 	if err != nil {
@@ -103,20 +114,25 @@ func (p *Provider) fetchSinglePR(ctx context.Context, ref ports.SCMPRRef) (ports
 		prObs.URLAlias = requested
 	}
 
-	var entries []bbDiffstatEntry
-	err = p.client.paginate(ctx, repoAPIPath(repo)+"/pullrequests/"+strconv.Itoa(ref.Number)+"/diffstat", url.Values{"pagelen": {"500"}}, func(raw jsonRaw) error {
-		var e bbDiffstatEntry
-		if err := unmarshal(raw, &e); err != nil {
-			return fmt.Errorf("bitbucket scm: decode diffstat entry: %w", err)
+	// The diffstat only feeds line counts and the conflict flag, and only an
+	// open PR can conflict, so it is skipped for merged/declined PRs and its
+	// failure degrades to unknown instead of hiding the PR's state. A throttle
+	// still propagates so the observer backs off.
+	conflict := false
+	if pr.State == prStateOpen {
+		entries, err := p.fetchDiffstat(ctx, repo, ref.Number)
+		var rl *RateLimitError
+		switch {
+		case errors.As(err, &rl):
+			return ports.SCMObservation{}, fmt.Errorf("bitbucket scm: fetch diffstat: %w", err)
+		case err != nil:
+			p.client.logger.Debug("bitbucket scm: diffstat unavailable; leaving diff stats and mergeability unknown", "repo", repo.Repo, "pr", ref.Number, "err", err)
+		default:
+			var added, removed int
+			added, removed, conflict = diffstatSummary(entries)
+			prObs.Additions, prObs.Deletions, prObs.ChangedFiles = added, removed, len(entries)
 		}
-		entries = append(entries, e)
-		return nil
-	})
-	if err != nil {
-		return ports.SCMObservation{}, fmt.Errorf("bitbucket scm: fetch diffstat: %w", notFound(err))
 	}
-	added, removed, conflict := diffstatSummary(entries)
-	prObs.Additions, prObs.Deletions, prObs.ChangedFiles = added, removed, len(entries)
 
 	ci, err := p.fetchCI(ctx, repo, prObs.HeadSHA)
 	if err != nil {
@@ -134,6 +150,19 @@ func (p *Provider) fetchSinglePR(ctx context.Context, ref ports.SCMPRRef) (ports
 		Review:       ports.SCMReviewObservation{Decision: string(decision)},
 		Mergeability: mergeability(conflict, pr.State),
 	}, nil
+}
+
+func (p *Provider) fetchDiffstat(ctx context.Context, repo ports.SCMRepo, number int) ([]bbDiffstatEntry, error) {
+	var entries []bbDiffstatEntry
+	err := p.client.paginate(ctx, repoAPIPath(repo)+"/pullrequests/"+strconv.Itoa(number)+"/diffstat", url.Values{"pagelen": {"500"}}, func(raw jsonRaw) error {
+		var e bbDiffstatEntry
+		if err := unmarshal(raw, &e); err != nil {
+			return fmt.Errorf("bitbucket scm: decode diffstat entry: %w", err)
+		}
+		entries = append(entries, e)
+		return nil
+	})
+	return entries, err
 }
 
 // fetchCI reads the commit statuses of headSHA. A 403 degrades to unknown CI
@@ -172,25 +201,30 @@ func (p *Provider) FetchFailedCheckLogTail(ctx context.Context, repo ports.SCMRe
 		return "", fmt.Errorf("%w: bitbucket log tail for non-Pipelines status %q", ports.ErrSCMUnsupported, check.URL)
 	}
 	stepsPath := repoAPIPath(repo) + "/pipelines/" + url.PathEscape(pipelineID) + "/steps/"
-	var steps struct {
-		Values []struct {
+	stepUUID := ""
+	errStop := errors.New("failed step found")
+	err := p.client.paginate(ctx, strings.TrimSuffix(stepsPath, "/")+"/", url.Values{"pagelen": {"100"}}, func(raw jsonRaw) error {
+		var s struct {
 			UUID  string `json:"uuid"`
 			State struct {
 				Result struct {
 					Name string `json:"name"`
 				} `json:"result"`
 			} `json:"state"`
-		} `json:"values"`
-	}
-	if _, err := p.client.do(ctx, "GET", stepsPath, nil, nil, &steps); err != nil {
-		return "", notFound(err)
-	}
-	stepUUID := ""
-	for _, s := range steps.Values {
-		if s.State.Result.Name == "FAILED" {
-			stepUUID = s.UUID
-			break
 		}
+		if err := unmarshal(raw, &s); err != nil {
+			return fmt.Errorf("bitbucket scm: decode pipeline step: %w", err)
+		}
+		// A step that errored (setup or infrastructure failure) has no
+		// FAILED result but still explains a red pipeline.
+		if r := s.State.Result.Name; r == "FAILED" || r == "ERROR" {
+			stepUUID = s.UUID
+			return errStop
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStop) {
+		return "", notFound(err)
 	}
 	if stepUUID == "" {
 		return "", fmt.Errorf("%w: bitbucket pipeline %s has no failed step", ports.ErrSCMNotFound, pipelineID)
@@ -232,7 +266,7 @@ func pipelineIDFromURL(repo ports.SCMRepo, raw string) (string, bool) {
 func (p *Provider) FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error) {
 	repo := ref.Repo
 	var comments []bbComment
-	err := p.client.paginate(ctx, repoAPIPath(repo)+"/pullrequests/"+strconv.Itoa(ref.Number)+"/comments", url.Values{"pagelen": {"100"}}, func(raw jsonRaw) error {
+	err := p.client.paginate(ctx, repoAPIPath(repo)+"/pullrequests/"+strconv.Itoa(ref.Number)+"/comments", url.Values{"pagelen": {"100"}, "sort": {"created_on"}}, func(raw jsonRaw) error {
 		var c bbComment
 		if err := unmarshal(raw, &c); err != nil {
 			return fmt.Errorf("bitbucket scm: decode comment: %w", err)

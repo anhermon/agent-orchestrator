@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -508,5 +509,184 @@ func TestCheckStateMapping(t *testing.T) {
 		if got := checkStatus(in); got != want {
 			t.Errorf("checkStatus(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func providerFor(t *testing.T, h http.HandlerFunc) *Provider {
+	t.Helper()
+	srv := newTestServer(t, h)
+	p, err := NewProvider(ProviderOptions{Credentials: StaticCredentialSource{Username: testUser, Token: testToken}, APIBase: srv.URL + "/2.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+type retryHinter interface{ GetRetryAfter() time.Duration }
+
+func TestOnlyThrottleErrorsSatisfyRateLimitContract(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		header   map[string]string
+		throttle bool
+	}{
+		{"404", 404, nil, false},
+		{"500", 500, nil, false},
+		{"400", 400, nil, false},
+		{"401", 401, nil, false},
+		{"403 plain", 403, nil, false},
+		{"429", 429, map[string]string{"Retry-After": "5"}, true},
+		{"429 without header", 429, nil, true},
+		{"403 with Retry-After", 403, map[string]string{"Retry-After": "5"}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, p := newFake(t, map[string]route{repoPath + "/pullrequests": {status: c.status, header: c.header, body: "x"}})
+			_, err := p.ListPRsByRepo(context.Background(), testRepo, time.Time{})
+			var rl retryHinter
+			if got := errors.As(err, &rl); got != c.throttle {
+				t.Fatalf("errors.As(rateLimited) = %v, want %v (err=%v)", got, c.throttle, err)
+			}
+		})
+	}
+}
+
+func TestFetchPullRequestsDiffstatFailureDegrades(t *testing.T) {
+	routes := prRoutes(t, "7", "pr_detail_open_approved.json", "diffstat_clean.json")
+	routes[repoPath+"/pullrequests/7/diffstat"] = route{status: http.StatusInternalServerError, body: "boom"}
+	_, p := newFake(t, routes)
+	got, err := p.FetchPullRequests(context.Background(), []ports.SCMPRRef{{Repo: testRepo, Number: 7}})
+	if err != nil || !got[0].Fetched {
+		t.Fatalf("got %+v, %v; a diffstat failure must not fail the PR", got[0], err)
+	}
+	o := got[0]
+	if o.PR.Additions != 0 || o.PR.ChangedFiles != 0 || o.Mergeability.State != string(domain.MergeUnknown) {
+		t.Errorf("diffstat not left unknown: %+v %+v", o.PR, o.Mergeability)
+	}
+}
+
+func TestFetchPullRequestsDiffstatThrottlePropagates(t *testing.T) {
+	routes := prRoutes(t, "7", "pr_detail_open_approved.json", "diffstat_clean.json")
+	routes[repoPath+"/pullrequests/7/diffstat"] = route{status: http.StatusTooManyRequests, header: map[string]string{"Retry-After": "9"}}
+	_, p := newFake(t, routes)
+	got, _ := p.FetchPullRequests(context.Background(), []ports.SCMPRRef{{Repo: testRepo, Number: 7}})
+	var rl retryHinter
+	if got[0].Fetched || !errors.As(got[0].Error, &rl) {
+		t.Fatalf("got %+v; a throttled diffstat must surface for cooldown", got[0])
+	}
+}
+
+func TestFetchPullRequestsSkipsDiffstatForNonOpen(t *testing.T) {
+	routes := prRoutes(t, "6", "pr_detail_merged.json", "diffstat_clean.json")
+	routes[repoPath+"/pullrequests/6/diffstat"] = route{status: http.StatusInternalServerError}
+	f, p := newFake(t, routes)
+	got, err := p.FetchPullRequests(context.Background(), []ports.SCMPRRef{{Repo: testRepo, Number: 6}})
+	if err != nil || !got[0].Fetched || !got[0].PR.Merged {
+		t.Fatalf("got %+v, %v", got[0], err)
+	}
+	if f.request(repoPath+"/pullrequests/6/diffstat") != nil {
+		t.Fatal("diffstat requested for a merged PR")
+	}
+}
+
+func TestFetchFailedCheckLogTailPaginatesStepsAndAcceptsError(t *testing.T) {
+	stepsPath := repoPath + "/pipelines/{pl-1}/steps/"
+	var logPath string
+	p := providerFor(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case stepsPath:
+			if r.URL.Query().Get("page") == "2" {
+				w.Write([]byte(`{"values":[{"uuid":"{s-err}","state":{"result":{"name":"ERROR"}}}]}`))
+				return
+			}
+			w.Write([]byte(`{"values":[{"uuid":"{s-ok}","state":{"result":{"name":"SUCCESSFUL"}}}],"next":"http://` + r.Host + stepsPath + `?page=2"}`))
+		default:
+			logPath = r.URL.Path
+			w.Write([]byte("a\nb\n"))
+		}
+	})
+	check := ports.SCMCheckObservation{URL: "https://bitbucket.org/acme/repo/addon/pipelines/home#!/results/{pl-1}"}
+	got, err := p.FetchFailedCheckLogTail(context.Background(), testRepo, check)
+	if err != nil || got != "a\nb" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	if logPath != stepsPath+"{s-err}/log" {
+		t.Fatalf("log fetched from %q, want the ERROR step on page 2", logPath)
+	}
+}
+
+func TestListPRsByRepoDedupesKeepingLatest(t *testing.T) {
+	entry := func(id int, updated string) string {
+		return fmt.Sprintf(`{"id":%d,"state":"OPEN","title":"t%s","updated_on":"%s"}`, id, updated[:10], updated)
+	}
+	p := providerFor(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "2" {
+			w.Write([]byte(`{"values":[` + entry(7, "2026-11-05T00:00:00.000000+00:00") + `,` + entry(3, "2026-11-01T00:00:00.000000+00:00") + `]}`))
+			return
+		}
+		w.Write([]byte(`{"values":[` + entry(7, "2026-11-02T00:00:00.000000+00:00") + `,` + entry(5, "2026-11-04T00:00:00.000000+00:00") + `],"next":"http://` + r.Host + r.URL.Path + `?page=2"}`))
+	})
+	got, err := p.ListPRsByRepo(context.Background(), testRepo, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0].Number != 7 || got[1].Number != 5 || got[2].Number != 3 {
+		t.Fatalf("got %+v, want 7,5,3 once each", got)
+	}
+	if got[0].Title != "t2026-11-05" {
+		t.Fatalf("PR 7 kept the stale entry: %q", got[0].Title)
+	}
+}
+
+func TestCIObservationPicksLatestPerKeyRegardlessOfOrder(t *testing.T) {
+	at := func(h int) time.Time { return time.Date(2026, 11, 2, h, 0, 0, 0, time.UTC) }
+	// Oldest first: a server ignoring sort must not make the stale FAILED win.
+	ci := ciObservation("sha", []bbStatus{
+		{Key: "k", Name: "unit", State: "FAILED", UpdatedOn: at(1)},
+		{Key: "k", Name: "unit", State: "SUCCESSFUL", UpdatedOn: at(2)},
+	})
+	if ci.Summary != string(domain.CIPassing) || len(ci.Checks) != 1 || ci.Checks[0].Conclusion != "SUCCESSFUL" || len(ci.FailedChecks) != 0 {
+		t.Fatalf("ci = %+v", ci)
+	}
+}
+
+func TestFetchReviewThreadsRequestsCreatedOrderAndKeepsRepliesOfDeletedRoot(t *testing.T) {
+	var sort string
+	p := providerFor(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case repoPath + "/pullrequests/7/comments":
+			sort = r.URL.Query().Get("sort")
+			w.Write([]byte(`{"values":[
+				{"id":1,"deleted":true,"content":{"raw":"gone"},"user":{"nickname":"bob"},"inline":{"path":"a.go","to":4}},
+				{"id":2,"deleted":false,"content":{"raw":"still here"},"user":{"nickname":"ann"},"parent":{"id":1}},
+				{"id":3,"deleted":false,"content":{"raw":"orphan"},"user":{"nickname":"ann"},"parent":{"id":99}}]}`))
+		case repoPath + "/pullrequests/7":
+			w.Write([]byte(fixture(t, "pr_detail_open_approved.json")))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	got, err := p.FetchReviewThreads(context.Background(), ports.SCMPRRef{Repo: testRepo, Number: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sort != "created_on" {
+		t.Fatalf("sort = %q, want created_on", sort)
+	}
+	if len(got.Threads) != 1 {
+		t.Fatalf("threads = %+v, want only the deleted-root thread", got.Threads)
+	}
+	th := got.Threads[0]
+	if th.ID != "1" || th.Path != "a.go" || th.Line != 4 || len(th.Comments) != 1 || th.Comments[0].Body != "still here" {
+		t.Fatalf("thread = %+v", th)
+	}
+}
+
+func TestFetchReviewThreadsPRNotFound(t *testing.T) {
+	_, p := newFake(t, map[string]route{repoPath + "/pullrequests/7/comments": ok(`{"values":[]}`)})
+	_, err := p.FetchReviewThreads(context.Background(), ports.SCMPRRef{Repo: testRepo, Number: 7})
+	if !errors.Is(err, ports.ErrSCMNotFound) {
+		t.Fatalf("err = %v, want ErrSCMNotFound", err)
 	}
 }

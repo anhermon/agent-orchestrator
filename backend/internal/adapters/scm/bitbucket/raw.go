@@ -44,9 +44,9 @@ func (c *client) doRaw(ctx context.Context, path string, headers map[string]stri
 	case resp.StatusCode == http.StatusUnauthorized:
 		return nil, fmt.Errorf("bitbucket scm: GET %s: %w", req.URL.Path, newAPIError(resp, raw, ErrAuthFailed))
 	case resp.StatusCode == http.StatusForbidden:
-		return nil, fmt.Errorf("bitbucket scm: GET %s: %w", req.URL.Path, newAPIError(resp, raw, ports.ErrSCMForbidden))
+		return nil, fmt.Errorf("bitbucket scm: GET %s: %w", req.URL.Path, throttleError(newAPIError(resp, raw, ports.ErrSCMForbidden)))
 	default:
-		return nil, newAPIError(resp, raw, nil)
+		return nil, throttleError(newAPIError(resp, raw, nil))
 	}
 }
 

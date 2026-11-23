@@ -77,15 +77,15 @@ func TestClientErrorMapping(t *testing.T) {
 			}
 		}},
 		{"429", 429, map[string]string{"Retry-After": "7"}, func(t *testing.T, err error) {
-			var apiErr *APIError
-			if !errors.As(err, &apiErr) || apiErr.Status != 429 {
-				t.Fatalf("err=%v, want *APIError 429", err)
+			var rl *RateLimitError
+			if !errors.As(err, &rl) || rl.Err.Status != 429 {
+				t.Fatalf("err=%v, want *RateLimitError 429", err)
 			}
-			if apiErr.GetRetryAfter() != 7*time.Second {
-				t.Fatalf("RetryAfter=%v", apiErr.GetRetryAfter())
+			if rl.GetRetryAfter() != 7*time.Second {
+				t.Fatalf("RetryAfter=%v", rl.GetRetryAfter())
 			}
-			if !apiErr.GetResetAt().IsZero() {
-				t.Fatalf("ResetAt=%v, want zero", apiErr.GetResetAt())
+			if !rl.GetResetAt().IsZero() {
+				t.Fatalf("ResetAt=%v, want zero", rl.GetResetAt())
 			}
 		}},
 		{"500", 500, nil, func(t *testing.T, err error) {
@@ -241,12 +241,12 @@ func TestClientAuthErrorsKeepBodyAndRetryAfter(t *testing.T) {
 	if !errors.Is(err, ports.ErrSCMForbidden) {
 		t.Fatalf("err=%v, want ErrSCMForbidden", err)
 	}
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
-		t.Fatalf("err=%v, want *APIError for rate-limit detection", err)
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("err=%v, want *RateLimitError for rate-limit detection", err)
 	}
-	if apiErr.GetRetryAfter() != 30*time.Second {
-		t.Fatalf("RetryAfter=%v", apiErr.GetRetryAfter())
+	if rl.GetRetryAfter() != 30*time.Second {
+		t.Fatalf("RetryAfter=%v", rl.GetRetryAfter())
 	}
 	if !strings.Contains(err.Error(), "rate limit exceeded") {
 		t.Fatalf("body excerpt missing from %v", err)

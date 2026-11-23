@@ -58,20 +58,32 @@ func (e *APIError) Error() string {
 	return msg
 }
 
-// GetRetryAfter exposes the Retry-After hint for the observer's cooldown helper.
-func (e *APIError) GetRetryAfter() time.Duration {
-	if e == nil {
-		return 0
-	}
-	return e.RetryAfter
+// RateLimitError is an APIError the server sent to throttle the client: HTTP
+// 429, or 403 carrying Retry-After. Only this type satisfies the observer's
+// rate-limit contract (GetRetryAfter/GetResetAt), so a 404, 5xx or plain 403
+// never puts the provider into cooldown. It unwraps to the *APIError.
+type RateLimitError struct {
+	Err *APIError
 }
 
+func (e *RateLimitError) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the underlying *APIError (and through it any 403 sentinel).
+func (e *RateLimitError) Unwrap() error { return e.Err }
+
+// GetRetryAfter exposes the Retry-After hint for the observer's cooldown helper.
+func (e *RateLimitError) GetRetryAfter() time.Duration { return e.Err.RetryAfter }
+
 // GetResetAt exposes the reset-time hint for the observer's cooldown helper.
-func (e *APIError) GetResetAt() time.Time {
-	if e == nil {
-		return time.Time{}
+func (e *RateLimitError) GetResetAt() time.Time { return e.Err.ResetAt }
+
+// throttleError wraps e as a *RateLimitError when the response is a throttle
+// (429, or 403 with Retry-After); otherwise it returns e unchanged.
+func throttleError(e *APIError) error {
+	if e.Status == http.StatusTooManyRequests || (e.Status == http.StatusForbidden && e.RetryAfter > 0) {
+		return &RateLimitError{Err: e}
 	}
-	return e.ResetAt
+	return e
 }
 
 type clientOptions struct {
@@ -175,9 +187,9 @@ func (c *client) doURL(ctx context.Context, method, fullURL string, body any, ou
 	case resp.StatusCode == http.StatusUnauthorized:
 		return resp, fmt.Errorf("bitbucket scm: %s %s: %w", method, req.URL.Path, newAPIError(resp, raw, ErrAuthFailed))
 	case resp.StatusCode == http.StatusForbidden:
-		return resp, fmt.Errorf("bitbucket scm: %s %s: %w", method, req.URL.Path, newAPIError(resp, raw, ports.ErrSCMForbidden))
+		return resp, fmt.Errorf("bitbucket scm: %s %s: %w", method, req.URL.Path, throttleError(newAPIError(resp, raw, ports.ErrSCMForbidden)))
 	default:
-		return resp, newAPIError(resp, raw, nil)
+		return resp, throttleError(newAPIError(resp, raw, nil))
 	}
 }
 
