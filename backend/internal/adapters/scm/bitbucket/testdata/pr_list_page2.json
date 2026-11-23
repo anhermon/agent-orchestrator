@@ -1,0 +1,101 @@
+{
+  "pagelen": 2,
+  "values": [
+    {
+      "id": 5,
+      "title": "PR 5",
+      "state": "DECLINED",
+      "draft": false,
+      "author": {
+        "display_name": "Ann A",
+        "nickname": "ann",
+        "type": "user",
+        "links": {
+          "avatar": {
+            "href": "https://avatar/ann"
+          }
+        }
+      },
+      "source": {
+        "branch": {
+          "name": "feature/x"
+        },
+        "commit": {
+          "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "repository": {
+          "full_name": "Acme/Repo",
+          "uuid": "{r-1}"
+        }
+      },
+      "destination": {
+        "branch": {
+          "name": "main"
+        },
+        "commit": {
+          "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "repository": {
+          "full_name": "acme/repo",
+          "uuid": "{r-1}"
+        }
+      },
+      "links": {
+        "html": {
+          "href": "https://bitbucket.org/acme/repo/pull-requests/5"
+        }
+      },
+      "created_on": "2026-11-01T10:00:00.000000+00:00",
+      "updated_on": "2026-11-06T12:00:00.123456+00:00",
+      "participants": []
+    },
+    {
+      "id": 4,
+      "title": "PR 4",
+      "state": "SUPERSEDED",
+      "draft": false,
+      "author": {
+        "display_name": "Ann A",
+        "nickname": "ann",
+        "type": "user",
+        "links": {
+          "avatar": {
+            "href": "https://avatar/ann"
+          }
+        }
+      },
+      "source": {
+        "branch": {
+          "name": "feature/x"
+        },
+        "commit": {
+          "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "repository": {
+          "full_name": "Acme/Repo",
+          "uuid": "{r-1}"
+        }
+      },
+      "destination": {
+        "branch": {
+          "name": "main"
+        },
+        "commit": {
+          "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "repository": {
+          "full_name": "acme/repo",
+          "uuid": "{r-1}"
+        }
+      },
+      "links": {
+        "html": {
+          "href": "https://bitbucket.org/acme/repo/pull-requests/4"
+        }
+      },
+      "created_on": "2026-11-01T10:00:00.000000+00:00",
+      "updated_on": "2026-11-05T12:00:00.123456+00:00",
+      "participants": []
+    }
+  ]
+}

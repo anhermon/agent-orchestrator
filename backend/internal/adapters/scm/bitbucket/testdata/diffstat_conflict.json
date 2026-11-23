@@ -1,0 +1,14 @@
+{
+  "values": [
+    {
+      "status": "modified",
+      "lines_added": 3,
+      "lines_removed": 1
+    },
+    {
+      "status": "merge conflict",
+      "lines_added": 5,
+      "lines_removed": 0
+    }
+  ]
+}

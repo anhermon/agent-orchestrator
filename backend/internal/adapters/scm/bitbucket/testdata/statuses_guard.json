@@ -1,0 +1,14 @@
+{
+  "pagelen": 1,
+  "values": [
+    {
+      "key": "step-2",
+      "state": "FAILED",
+      "name": "unit tests",
+      "url": "https://bitbucket.org/acme/repo/addon/pipelines/home#!/results/2",
+      "description": "d",
+      "created_on": "2026-11-02T12:02:00.000000+00:00",
+      "updated_on": "2026-11-02T12:02:00.000000+00:00"
+    }
+  ]
+}

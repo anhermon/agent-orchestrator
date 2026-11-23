@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -30,6 +31,9 @@ type ProviderOptions struct {
 type Provider struct {
 	client *client
 	creds  CredentialSource
+	// forbiddenWarned records the repos whose commit statuses already produced
+	// the "forbidden" warning, so a polling loop warns once per repo.
+	forbiddenWarned sync.Map
 }
 
 // NewProvider creates a Bitbucket Cloud SCM provider. Credentials are resolved

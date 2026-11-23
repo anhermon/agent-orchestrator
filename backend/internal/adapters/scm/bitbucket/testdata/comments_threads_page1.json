@@ -1,0 +1,69 @@
+{
+  "pagelen": 3,
+  "values": [
+    {
+      "id": 1,
+      "content": {
+        "raw": "inline root"
+      },
+      "user": {
+        "display_name": "Bob B",
+        "nickname": "bob",
+        "type": "user"
+      },
+      "created_on": "2026-11-02T10:01:00.000000+00:00",
+      "deleted": false,
+      "links": {
+        "html": {
+          "href": "https://bitbucket.org/acme/repo/pull-requests/7/_/diff#comment-1"
+        }
+      },
+      "inline": {
+        "path": "src/a.go",
+        "from": null,
+        "to": 12
+      },
+      "resolution": null
+    },
+    {
+      "id": 2,
+      "content": {
+        "raw": "general root"
+      },
+      "user": {
+        "display_name": "Bob B",
+        "nickname": "bob",
+        "type": "user"
+      },
+      "created_on": "2026-11-02T10:02:00.000000+00:00",
+      "deleted": false,
+      "links": {
+        "html": {
+          "href": "https://bitbucket.org/acme/repo/pull-requests/7/_/diff#comment-2"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "content": {
+        "raw": "reply to inline"
+      },
+      "user": {
+        "display_name": "CI Bot",
+        "nickname": "ci",
+        "type": "app_user"
+      },
+      "created_on": "2026-11-02T10:03:00.000000+00:00",
+      "deleted": false,
+      "links": {
+        "html": {
+          "href": "https://bitbucket.org/acme/repo/pull-requests/7/_/diff#comment-3"
+        }
+      },
+      "parent": {
+        "id": 1
+      }
+    }
+  ],
+  "next": "__NEXT__"
+}

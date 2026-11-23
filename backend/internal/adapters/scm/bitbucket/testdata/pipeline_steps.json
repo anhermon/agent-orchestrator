@@ -1,0 +1,24 @@
+{
+  "values": [
+    {
+      "uuid": "{s-ok}",
+      "name": "build",
+      "state": {
+        "name": "COMPLETED",
+        "result": {
+          "name": "SUCCESSFUL"
+        }
+      }
+    },
+    {
+      "uuid": "{s-bad}",
+      "name": "unit tests",
+      "state": {
+        "name": "COMPLETED",
+        "result": {
+          "name": "FAILED"
+        }
+      }
+    }
+  ]
+}
