@@ -17,3 +17,5 @@ TBD: location of the job that fast-forwards `main` from upstream and merges it i
 ## Upstream files we modify
 | File | Function | Reason | Task |
 | --- | --- | --- | --- |
+| backend/internal/daemon/scm_wiring.go | startSCMObserver, newMultiSCMProvider, newMultiSCMMerger | Register the bitbucket provider/merger after the gitlab block (one block per site) | 4 |
+| backend/internal/daemon/scm_wiring.go | logSCMProviderDisabled | Treat bitbucket ErrNoCredentials/ErrAuthFailed as the "no usable token" warning | 4 |

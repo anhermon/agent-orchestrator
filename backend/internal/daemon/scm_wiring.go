@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sync"
 
+	scmbitbucket "github.com/aoagents/agent-orchestrator/backend/internal/adapters/scm/bitbucket"
 	scmgithub "github.com/aoagents/agent-orchestrator/backend/internal/adapters/scm/github"
 	scmgitlab "github.com/aoagents/agent-orchestrator/backend/internal/adapters/scm/gitlab"
 	scmmulti "github.com/aoagents/agent-orchestrator/backend/internal/adapters/scm/multi"
@@ -19,7 +20,7 @@ import (
 )
 
 // startSCMObserver wires the provider-neutral SCM observer with both GitHub
-// and GitLab providers via a multi Provider dispatcher. Missing credentials
+// GitLab and Bitbucket providers via a multi Provider dispatcher. Missing credentials
 // for one provider do not prevent the other from starting; the observer is
 // disabled only when no provider has usable credentials.
 func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.Manager, branchStates scmobserve.BranchStateReconciler, gitlabCfg config.GitLabConfig, reviewRefresher *scmReviewRefresher, logger *slog.Logger) <-chan struct{} {
@@ -37,6 +38,13 @@ func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.M
 		logSCMProviderDisabled(logger, "gitlab", glErr)
 	} else {
 		named = append(named, scmmulti.NamedProvider{Key: "gitlab", Provider: glProvider})
+	}
+
+	bbProvider, bbErr := newBitbucketSCMProvider(logger)
+	if bbErr != nil {
+		logSCMProviderDisabled(logger, "bitbucket", bbErr)
+	} else {
+		named = append(named, scmmulti.NamedProvider{Key: "bitbucket", Provider: bbProvider})
 	}
 
 	if len(named) == 0 {
@@ -89,7 +97,8 @@ func newGitLabSCMProvider(gitlabCfg config.GitLabConfig, logger *slog.Logger) (*
 
 func logSCMProviderDisabled(logger *slog.Logger, provider string, err error) {
 	if errors.Is(err, scmgithub.ErrNoToken) || errors.Is(err, scmgithub.ErrAuthFailed) ||
-		errors.Is(err, scmgitlab.ErrNoToken) || errors.Is(err, scmgitlab.ErrAuthFailed) {
+		errors.Is(err, scmgitlab.ErrNoToken) || errors.Is(err, scmgitlab.ErrAuthFailed) ||
+		errors.Is(err, scmbitbucket.ErrNoCredentials) || errors.Is(err, scmbitbucket.ErrAuthFailed) {
 		logger.Warn("scm provider disabled: no usable token", "provider", provider, "err", err)
 	} else {
 		logger.Warn("scm provider disabled: setup failed", "provider", provider, "err", err)
@@ -106,6 +115,9 @@ func newMultiSCMProvider(gitlabCfg config.GitLabConfig, logger *slog.Logger) *sc
 	}
 	if gl, err := newGitLabSCMProvider(gitlabCfg, logger); err == nil {
 		named = append(named, scmmulti.NamedProvider{Key: "gitlab", Provider: gl})
+	}
+	if bb, err := newBitbucketSCMProvider(logger); err == nil {
+		named = append(named, scmmulti.NamedProvider{Key: "bitbucket", Provider: bb})
 	}
 	if len(named) == 0 {
 		return nil
@@ -125,6 +137,9 @@ func newMultiSCMMerger(gitlabCfg config.GitLabConfig, logger *slog.Logger) *scmm
 	}
 	if gl, err := newGitLabSCMProvider(gitlabCfg, logger); err == nil {
 		named = append(named, scmmulti.NamedMerger{Key: "gitlab", Merger: gl})
+	}
+	if bb, err := newBitbucketSCMProvider(logger); err == nil {
+		named = append(named, scmmulti.NamedMerger{Key: "bitbucket", Merger: bb})
 	}
 	if len(named) == 0 {
 		return nil
