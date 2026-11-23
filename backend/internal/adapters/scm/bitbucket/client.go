@@ -24,26 +24,38 @@ const (
 	maxErrorBodyBytes = 512
 	// maxPages guards paginate against a server that never stops sending next.
 	maxPages = 1000
+	// maxRetryAfter caps a server-supplied Retry-After so a bogus value cannot
+	// park the observer indefinitely.
+	maxRetryAfter = time.Hour
 )
 
 // APIError is a non-success Bitbucket response that has no dedicated sentinel
-// (401 and 403 map to ErrAuthFailed and ports.ErrSCMForbidden). It satisfies
-// the observer's rate-limit contract through GetRetryAfter and GetResetAt.
-// Bitbucket sends only Retry-After (seconds), so ResetAt is normally zero.
+// (401 and 403 carry ErrAuthFailed and ports.ErrSCMForbidden as the unwrapped
+// cause). It satisfies the observer's rate-limit contract through GetRetryAfter
+// and GetResetAt. Bitbucket sends only Retry-After, so ResetAt is normally zero.
 type APIError struct {
 	Status     int
 	RetryAfter time.Duration
 	ResetAt    time.Time
 	Body       string
+	// cause is the sentinel for 401/403, exposed through Unwrap.
+	cause error
 }
+
+// Unwrap exposes the sentinel (ErrAuthFailed or ports.ErrSCMForbidden), if any.
+func (e *APIError) Unwrap() error { return e.cause }
 
 // Error formats the response status and a truncated body. It never includes
 // request headers, so credentials cannot leak through it.
 func (e *APIError) Error() string {
-	if e.Body == "" {
-		return fmt.Sprintf("bitbucket scm: HTTP %d", e.Status)
+	msg := fmt.Sprintf("bitbucket scm: HTTP %d", e.Status)
+	if e.cause != nil {
+		msg += ": " + e.cause.Error()
 	}
-	return fmt.Sprintf("bitbucket scm: HTTP %d: %s", e.Status, e.Body)
+	if e.Body != "" {
+		msg += ": " + e.Body
+	}
+	return msg
 }
 
 // GetRetryAfter exposes the Retry-After hint for the observer's cooldown helper.
@@ -79,7 +91,7 @@ type client struct {
 	logger    *slog.Logger
 }
 
-func newClient(opts clientOptions) *client {
+func newClient(opts clientOptions) (*client, error) {
 	hc := opts.httpClient
 	if hc == nil {
 		hc = &http.Client{Timeout: defaultTimeout}
@@ -96,8 +108,14 @@ func newClient(opts clientOptions) *client {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	baseURL, _ := url.Parse(base) // an unparseable base fails every request below
-	return &client{http: hc, creds: opts.creds, apiBase: base, baseURL: baseURL, userAgent: ua, logger: logger}
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return nil, fmt.Errorf("bitbucket scm: invalid API base URL: %w", err)
+	}
+	if baseURL.Scheme == "" || baseURL.Host == "" {
+		return nil, fmt.Errorf("bitbucket scm: invalid API base URL %q: scheme and host are required", base)
+	}
+	return &client{http: hc, creds: opts.creds, apiBase: base, baseURL: baseURL, userAgent: ua, logger: logger}, nil
 }
 
 // do sends one request to APIBase+path with basic auth. A non-nil body is sent
@@ -155,26 +173,53 @@ func (c *client) doURL(ctx context.Context, method, fullURL string, body any, ou
 		}
 		return resp, nil
 	case resp.StatusCode == http.StatusUnauthorized:
-		return resp, fmt.Errorf("bitbucket scm: %s %s: %w", method, req.URL.Path, ErrAuthFailed)
+		return resp, fmt.Errorf("bitbucket scm: %s %s: %w", method, req.URL.Path, newAPIError(resp, raw, ErrAuthFailed))
 	case resp.StatusCode == http.StatusForbidden:
-		return resp, fmt.Errorf("bitbucket scm: %s %s: %w", method, req.URL.Path, ports.ErrSCMForbidden)
+		return resp, fmt.Errorf("bitbucket scm: %s %s: %w", method, req.URL.Path, newAPIError(resp, raw, ports.ErrSCMForbidden))
 	default:
-		return resp, newAPIError(resp, raw)
+		return resp, newAPIError(resp, raw, nil)
 	}
 }
 
-func newAPIError(resp *http.Response, raw []byte) *APIError {
-	e := &APIError{Status: resp.StatusCode}
+func newAPIError(resp *http.Response, raw []byte, cause error) *APIError {
 	if len(raw) > maxErrorBodyBytes {
 		raw = raw[:maxErrorBodyBytes]
 	}
-	e.Body = strings.TrimSpace(string(raw))
-	if ra := resp.Header.Get("Retry-After"); ra != "" {
-		if sec, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && sec >= 0 {
-			e.RetryAfter = time.Duration(sec) * time.Second
-		}
+	return &APIError{
+		Status:     resp.StatusCode,
+		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		// ToValidUTF8 drops a rune cut in half by the byte truncation.
+		Body:  strings.TrimSpace(strings.ToValidUTF8(string(raw), "")),
+		cause: cause,
 	}
-	return e
+}
+
+// parseRetryAfter accepts delay-seconds or an HTTP-date, caps the result at
+// maxRetryAfter, and returns 0 for an empty, invalid or already-past value.
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	var d time.Duration
+	if sec, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if sec <= 0 {
+			return 0
+		}
+		if sec > int64(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
+		d = time.Duration(sec) * time.Second
+	} else if at, err := http.ParseTime(value); err == nil {
+		d = at.Sub(now)
+	}
+	if d <= 0 {
+		return 0
+	}
+	if d > maxRetryAfter {
+		return maxRetryAfter
+	}
+	return d
 }
 
 // paginate GETs path and follows Bitbucket's "next" links, calling each for
@@ -185,7 +230,12 @@ func (c *client) paginate(ctx context.Context, path string, query url.Values, ea
 	if len(query) > 0 {
 		next += "?" + query.Encode()
 	}
+	visited := map[string]struct{}{}
 	for page := 0; next != ""; page++ {
+		if _, seen := visited[next]; seen {
+			return fmt.Errorf("bitbucket scm: pagination repeated next URL for %s", path)
+		}
+		visited[next] = struct{}{}
 		if page >= maxPages {
 			return fmt.Errorf("bitbucket scm: pagination exceeded %d pages for %s", maxPages, path)
 		}

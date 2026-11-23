@@ -12,6 +12,8 @@ const (
 	bitbucketHost = "bitbucket.org"
 )
 
+var defaultPorts = map[string]string{"ssh": "22", "http": "80", "https": "443"}
+
 // ParseRepository parses a Git remote URL and returns an SCMRepo when it points
 // at a bitbucket.org repository. Only the exact host bitbucket.org is accepted
 // so credentials are never attached to look-alike hosts.
@@ -39,6 +41,11 @@ func (p *Provider) ParseRepository(remote string) (ports.SCMRepo, bool) {
 		switch u.Scheme {
 		case "ssh", "http", "https":
 		default:
+			return ports.SCMRepo{}, false
+		}
+		// Bitbucket Cloud serves only the scheme's default port; anything else
+		// is a different server, so credentials must not be sent to it.
+		if port := u.Port(); port != "" && port != defaultPorts[u.Scheme] {
 			return ports.SCMRepo{}, false
 		}
 		host, path = u.Hostname(), u.Path

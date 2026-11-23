@@ -54,8 +54,10 @@ func (s StaticCredentialSource) Credentials(context.Context) (Credentials, error
 	return Credentials{Username: u, Token: t}, nil
 }
 
-// EnvCredentialSource reads the first non-empty value from UserVars and from
-// TokenVars. Order matters: list the AO_-prefixed variable first.
+// EnvCredentialSource reads a username and token as a pair: UserVars[i] and
+// TokenVars[i] belong together, and the first index where both are set wins.
+// Order matters: list the AO_-prefixed variables first. A username from one
+// pair is never combined with a token from another.
 type EnvCredentialSource struct {
 	UserVars  []string
 	TokenVars []string
@@ -69,11 +71,14 @@ func DefaultEnvCredentialSource() EnvCredentialSource {
 // Credentials returns the env credentials, or ErrNoCredentials when the
 // username or the token is missing.
 func (s EnvCredentialSource) Credentials(context.Context) (Credentials, error) {
-	u, t := firstEnv(s.UserVars), firstEnv(s.TokenVars)
-	if u == "" || t == "" {
-		return Credentials{}, ErrNoCredentials
+	for i := 0; i < len(s.UserVars) && i < len(s.TokenVars); i++ {
+		u := strings.TrimSpace(os.Getenv(s.UserVars[i]))
+		t := strings.TrimSpace(os.Getenv(s.TokenVars[i]))
+		if u != "" && t != "" {
+			return Credentials{Username: u, Token: t}, nil
+		}
 	}
-	return Credentials{Username: u, Token: t}, nil
+	return Credentials{}, ErrNoCredentials
 }
 
 func firstEnv(names []string) string {

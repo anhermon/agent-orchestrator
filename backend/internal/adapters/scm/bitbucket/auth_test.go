@@ -154,3 +154,23 @@ type failingSource struct{ err error }
 func (f failingSource) Credentials(context.Context) (Credentials, error) {
 	return Credentials{}, f.err
 }
+
+func TestEnvCredentialSourceDoesNotMixPairs(t *testing.T) {
+	clearBitbucketEnv(t)
+	t.Setenv("AO_BITBUCKET_USERNAME", "ao-user")
+	t.Setenv("BITBUCKET_API_TOKEN", "plain-token")
+	_, err := DefaultEnvCredentialSource().Credentials(context.Background())
+	if !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("err=%v, want ErrNoCredentials for mixed AO_ user + BITBUCKET_ token", err)
+	}
+
+	// A complete lower-precedence pair is still used when the AO_ pair is partial.
+	t.Setenv("BITBUCKET_USERNAME", "plain-user")
+	creds, err := DefaultEnvCredentialSource().Credentials(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if creds.Username != "plain-user" || creds.Token != "plain-token" {
+		t.Fatalf("got %+v, want the BITBUCKET_ pair", creds)
+	}
+}

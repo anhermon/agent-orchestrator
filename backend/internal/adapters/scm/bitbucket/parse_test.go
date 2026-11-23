@@ -25,6 +25,15 @@ func TestParseRepository(t *testing.T) {
 		{"https://bitbucket.org/dealhubio/aura-sre/extra", false, "", ""},
 		{"https://bitbucket.org/dealhubio/.git", false, "", ""},
 		{"", false, "", ""},
+		{"ssh://git@bitbucket.org:7999/dealhubio/aura-sre.git", false, "", ""},
+		{"ssh://git@bitbucket.org:22/dealhubio/aura-sre.git", true, "dealhubio", "dealhubio/aura-sre"},
+		{"https://bitbucket.org:8443/dealhubio/aura-sre.git", false, "", ""},
+		{"https://bitbucket.org:443/dealhubio/aura-sre.git", true, "dealhubio", "dealhubio/aura-sre"},
+		{"bitbucket.org:dealhubio/aura-sre.git", true, "dealhubio", "dealhubio/aura-sre"},
+		{"https://bitbucket.org/dealhubio/aura-sre.git?foo=bar", true, "dealhubio", "dealhubio/aura-sre"},
+		{"https://bitbucket.org/dealhubio/aura-sre#readme", true, "dealhubio", "dealhubio/aura-sre"},
+		{"  git@bitbucket.org:dealhubio/aura-sre.git\n", true, "dealhubio", "dealhubio/aura-sre"},
+		{"ftp://bitbucket.org/dealhubio/aura-sre.git", false, "", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.remote, func(t *testing.T) {

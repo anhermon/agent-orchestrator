@@ -30,7 +30,6 @@ type ProviderOptions struct {
 type Provider struct {
 	client *client
 	creds  CredentialSource
-	logger *slog.Logger
 }
 
 // NewProvider creates a Bitbucket Cloud SCM provider. Credentials are resolved
@@ -45,17 +44,17 @@ func NewProvider(opts ProviderOptions) (*Provider, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Provider{
-		client: newClient(clientOptions{
-			httpClient: opts.HTTPClient,
-			creds:      creds,
-			apiBase:    opts.APIBase,
-			userAgent:  opts.UserAgent,
-			logger:     logger,
-		}),
-		creds:  creds,
-		logger: logger,
-	}, nil
+	c, err := newClient(clientOptions{
+		httpClient: opts.HTTPClient,
+		creds:      creds,
+		apiBase:    opts.APIBase,
+		userAgent:  opts.UserAgent,
+		logger:     logger,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Provider{client: c, creds: creds}, nil
 }
 
 // SCMCredentialsAvailable reports whether usable Bitbucket credentials exist.

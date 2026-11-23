@@ -204,3 +204,114 @@ func TestPaginateStopsWhenCallbackFails(t *testing.T) {
 		t.Fatalf("err=%v hits=%d", err, hits)
 	}
 }
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		in   string
+		want time.Duration
+	}{
+		{"seconds", "7", 7 * time.Second},
+		{"padded", " 12 ", 12 * time.Second},
+		{"http-date", now.Add(90 * time.Second).Format(http.TimeFormat), 90 * time.Second},
+		{"past date", now.Add(-time.Minute).Format(http.TimeFormat), 0},
+		{"huge seconds capped", "99999999", time.Hour},
+		{"far future date capped", now.Add(48 * time.Hour).Format(http.TimeFormat), time.Hour},
+		{"negative", "-5", 0},
+		{"garbage", "soon", 0},
+		{"empty", "", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := parseRetryAfter(c.in, now); got != c.want {
+				t.Fatalf("parseRetryAfter(%q)=%v want %v", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestClientAuthErrorsKeepBodyAndRetryAfter(t *testing.T) {
+	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limit exceeded"}}`))
+	}))
+	_, err := p.client.do(context.Background(), http.MethodGet, "/user", nil, nil, nil)
+	if !errors.Is(err, ports.ErrSCMForbidden) {
+		t.Fatalf("err=%v, want ErrSCMForbidden", err)
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err=%v, want *APIError for rate-limit detection", err)
+	}
+	if apiErr.GetRetryAfter() != 30*time.Second {
+		t.Fatalf("RetryAfter=%v", apiErr.GetRetryAfter())
+	}
+	if !strings.Contains(err.Error(), "rate limit exceeded") {
+		t.Fatalf("body excerpt missing from %v", err)
+	}
+	if strings.Contains(err.Error(), testToken) {
+		t.Fatalf("token leaked: %v", err)
+	}
+}
+
+func TestClientAuthErrorBodyIsBounded(t *testing.T) {
+	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(strings.Repeat("x", 5000)))
+	}))
+	_, err := p.client.do(context.Background(), http.MethodGet, "/user", nil, nil, nil)
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Fatalf("err=%v, want ErrAuthFailed", err)
+	}
+	if len(err.Error()) > 1024 {
+		t.Fatalf("error length %d, want bounded", len(err.Error()))
+	}
+}
+
+func TestPaginateStopsOnRepeatedNextURL(t *testing.T) {
+	hits := 0
+	var base string
+	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		fmt.Fprintf(w, `{"values":[1],"next":"%s%s"}`, base, r.URL.RequestURI())
+	}))
+	base = strings.TrimSuffix(p.client.apiBase, "/2.0")
+	err := p.client.paginate(context.Background(), "/items", nil, func(json.RawMessage) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "repeated") {
+		t.Fatalf("err=%v, want repeated-next error", err)
+	}
+	if hits != 1 {
+		t.Fatalf("hits=%d, want 1", hits)
+	}
+}
+
+func TestPaginateStopsOnNextLoop(t *testing.T) {
+	hits := 0
+	var base string
+	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		other := "2"
+		if r.URL.Query().Get("page") == "2" {
+			other = "1"
+		}
+		fmt.Fprintf(w, `{"values":[1],"next":"%s/2.0/items?page=%s"}`, base, other)
+	}))
+	base = strings.TrimSuffix(p.client.apiBase, "/2.0")
+	err := p.client.paginate(context.Background(), "/items", url.Values{"page": {"1"}}, func(json.RawMessage) error { return nil })
+	if err == nil || hits > 2 {
+		t.Fatalf("err=%v hits=%d, want error after 2 hits", err, hits)
+	}
+}
+
+func TestNewProviderRejectsInvalidAPIBase(t *testing.T) {
+	for _, base := range []string{"://bad", "http://[::1", "no-scheme-or-host", "/relative/path"} {
+		t.Run(base, func(t *testing.T) {
+			p, err := NewProvider(ProviderOptions{Credentials: StaticCredentialSource{Username: "u", Token: "t"}, APIBase: base})
+			if err == nil || p != nil {
+				t.Fatalf("NewProvider(%q)=%v,%v want error", base, p, err)
+			}
+		})
+	}
+}
