@@ -58,9 +58,17 @@ func TestResolveFallsBackToCachedHeadWhenRemoteIsOffline(t *testing.T) {
 	}
 }
 
-func TestResolveRemotelessUsesCurrentBranchAndRecordsIt(t *testing.T) {
-	repo := localRepo(t, "main")
-	runGit(t, repo, "switch", "-c", "feature/temporary")
+// isolateGitConfig hides the developer's global and system git config so a
+// local init.defaultBranch cannot change what a test resolves.
+func isolateGitConfig(t *testing.T) {
+	t.Helper()
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+}
+
+func TestResolveRemotelessFallsBackToCheckedOutBranchAndRecordsIt(t *testing.T) {
+	isolateGitConfig(t)
+	repo := localRepo(t, "feature/temporary")
 
 	resolution, err := New("", nil).Resolve(context.Background(), context.Background(), repo)
 	if err != nil {
@@ -69,42 +77,55 @@ func TestResolveRemotelessUsesCurrentBranchAndRecordsIt(t *testing.T) {
 	if resolution.Branch != "feature/temporary" || resolution.Ref != "refs/heads/feature/temporary" || resolution.Remote != "" {
 		t.Fatalf("resolution = %#v, want local feature/temporary", resolution)
 	}
-	runGit(t, repo, "switch", "main")
+	if got := gitOutput(t, repo, "config", "--local", "--get", ManagedDefaultConfigKey); got != "feature/temporary" {
+		t.Fatalf("recorded %s = %q, want feature/temporary", ManagedDefaultConfigKey, got)
+	}
+	runGit(t, repo, "switch", "-c", "other")
 	again, err := New("", nil).Inspect(context.Background(), repo)
 	if err != nil || again.Branch != "feature/temporary" {
 		t.Fatalf("Inspect after checkout change = %#v, %v, want the recorded branch", again, err)
 	}
 }
 
-func TestResolveRemotelessFallsBackToInitDefaultBranchThenSingleConventionalBranch(t *testing.T) {
-	detached := func(t *testing.T, repo string) {
-		runGit(t, repo, "checkout", "--detach")
-	}
+func TestResolveRemotelessOrderPrefersInitDefaultThenSingleConventionalThenCheckedOut(t *testing.T) {
 	cases := []struct {
 		name  string
 		setup func(t *testing.T) string
 		want  string
 	}{
-		{"init.defaultBranch when HEAD is detached", func(t *testing.T) string {
-			repo := localRepo(t, "trunk")
+		{"HEAD on feature, init.defaultBranch trunk exists", func(t *testing.T) string {
+			repo := localRepo(t, "feature")
+			runGit(t, repo, "branch", "trunk")
 			runGit(t, repo, "branch", "main")
 			runGit(t, repo, "config", "init.defaultBranch", "trunk")
-			detached(t, repo)
 			return repo
 		}, "trunk"},
-		{"single main", func(t *testing.T) string {
-			repo := localRepo(t, "main")
-			detached(t, repo)
+		{"init.defaultBranch names a missing branch", func(t *testing.T) string {
+			repo := localRepo(t, "feature")
+			runGit(t, repo, "branch", "main")
+			runGit(t, repo, "config", "init.defaultBranch", "trunk")
 			return repo
 		}, "main"},
-		{"single master", func(t *testing.T) string {
-			repo := localRepo(t, "master")
-			detached(t, repo)
+		{"HEAD on feature, only main", func(t *testing.T) string {
+			repo := localRepo(t, "feature")
+			runGit(t, repo, "branch", "main")
+			return repo
+		}, "main"},
+		{"HEAD on feature, only master", func(t *testing.T) string {
+			repo := localRepo(t, "feature")
+			runGit(t, repo, "branch", "master")
 			return repo
 		}, "master"},
+		{"main and master, HEAD on feature falls to checked out", func(t *testing.T) string {
+			repo := localRepo(t, "feature")
+			runGit(t, repo, "branch", "main")
+			runGit(t, repo, "branch", "master")
+			return repo
+		}, "feature"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			isolateGitConfig(t)
 			resolution, err := New("", nil).Resolve(context.Background(), context.Background(), tc.setup(t))
 			if err != nil {
 				t.Fatalf("Resolve: %v", err)
@@ -116,9 +137,39 @@ func TestResolveRemotelessFallsBackToInitDefaultBranchThenSingleConventionalBran
 	}
 }
 
+func TestResolveRemotelessSurvivesReadOnlyGitConfig(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("file permissions do not restrict root")
+	}
+	isolateGitConfig(t)
+	repo := localRepo(t, "main")
+	gitDir := filepath.Join(repo, ".git")
+	config := filepath.Join(gitDir, "config")
+	if err := os.Chmod(config, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(gitDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(gitDir, 0o755); _ = os.Chmod(config, 0o644) })
+
+	r := New("", nil)
+	for _, call := range []struct {
+		name string
+		fn   func() (Resolution, error)
+	}{
+		{"Inspect", func() (Resolution, error) { return r.Inspect(context.Background(), repo) }},
+		{"Resolve", func() (Resolution, error) { return r.Resolve(context.Background(), context.Background(), repo) }},
+	} {
+		resolution, err := call.fn()
+		if err != nil || resolution.Branch != "main" {
+			t.Fatalf("%s on read-only repo = %#v, %v, want main without error", call.name, resolution, err)
+		}
+	}
+}
+
 func TestResolveRemotelessStaysUnresolvedWhenAmbiguous(t *testing.T) {
-	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	isolateGitConfig(t)
 	repo := localRepo(t, "main")
 	runGit(t, repo, "branch", "master")
 	runGit(t, repo, "checkout", "--detach")

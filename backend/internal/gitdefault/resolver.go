@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
@@ -331,10 +332,11 @@ func (r *Resolver) resolveAOInitialized(ctx context.Context, repo string) (Resol
 
 // resolveRemoteless resolves the default of a repository with no remote at
 // all, where there is no remote HEAD to consult. It prefers the branch AO
-// recorded; otherwise it falls back to local state: the checked-out branch,
-// then init.defaultBranch, then the single existing one of main/master. The
-// choice is recorded so later checkouts do not move the default. A repository
-// with a remote never takes this path.
+// recorded; otherwise it falls back to local state: init.defaultBranch (when
+// that branch exists), then the single existing one of main/master, then the
+// checked-out branch. The choice is recorded so later checkouts do not move
+// the default, but a failed write never fails resolution. A repository with a
+// remote never takes this path.
 func (r *Resolver) resolveRemoteless(ctx context.Context, repo string) (Resolution, error) {
 	resolved, err := r.resolveAOInitialized(ctx, repo)
 	if err == nil || !errors.Is(err, ErrUnresolved) {
@@ -348,7 +350,15 @@ func (r *Resolver) resolveRemoteless(ctx context.Context, repo string) (Resoluti
 		return Resolution{}, err
 	}
 	if _, cfgErr := r.run(ctx, r.binary, "-C", repo, "config", "--local", ManagedDefaultConfigKey, branch); cfgErr != nil {
-		return Resolution{}, fmt.Errorf("record %s for repository %q: %w", ManagedDefaultConfigKey, repo, cfgErr)
+		slog.Debug("gitdefault: could not record remoteless default branch", "repo", repo, "branch", branch, "err", cfgErr)
+		// A concurrent resolver may have recorded a branch; prefer it so callers agree.
+		if out, getErr := r.run(ctx, r.binary, "-C", repo, "config", "--local", "--get", ManagedDefaultConfigKey); getErr == nil {
+			if recorded := strings.TrimSpace(string(out)); recorded != "" {
+				if again, recErr := r.resolveAOInitialized(ctx, repo); recErr == nil && again.Branch == recorded {
+					return again, nil
+				}
+			}
+		}
 	}
 	return Resolution{Branch: branch, Ref: "refs/heads/" + branch, Source: SourceAOInitialized}, nil
 }
@@ -356,11 +366,6 @@ func (r *Resolver) resolveRemoteless(ctx context.Context, repo string) (Resoluti
 func (r *Resolver) localDefaultBranch(ctx context.Context, repo string) (string, bool) {
 	usable := func(branch string) bool {
 		return branch != "" && r.validateBranch(ctx, repo, branch) == nil && r.refExists(ctx, repo, "refs/heads/"+branch)
-	}
-	if out, err := r.run(ctx, r.binary, "-C", repo, "symbolic-ref", "--quiet", "--short", "HEAD"); err == nil {
-		if branch := strings.TrimSpace(string(out)); usable(branch) {
-			return branch, true
-		}
 	}
 	if out, err := r.run(ctx, r.binary, "-C", repo, "config", "--get", "init.defaultBranch"); err == nil {
 		if branch := strings.TrimSpace(string(out)); usable(branch) {
@@ -375,6 +380,11 @@ func (r *Resolver) localDefaultBranch(ctx context.Context, repo string) (string,
 	}
 	if len(found) == 1 {
 		return found[0], true
+	}
+	if out, err := r.run(ctx, r.binary, "-C", repo, "symbolic-ref", "--quiet", "--short", "HEAD"); err == nil {
+		if branch := strings.TrimSpace(string(out)); usable(branch) {
+			return branch, true
+		}
 	}
 	return "", false
 }

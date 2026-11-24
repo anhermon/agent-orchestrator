@@ -177,6 +177,7 @@ func (f *fakeProjectTeardowner) TeardownProject(_ context.Context, project domai
 }
 
 func TestManager_AddListGetRemove(t *testing.T) {
+	isolateGitConfig(t)
 	ctx := context.Background()
 	m := newManager(t)
 	repo := gitRepo(t)
@@ -748,6 +749,7 @@ func TestManager_RemoveDoesNotArchiveWhenTeardownFails(t *testing.T) {
 }
 
 func TestManager_DefaultsWhenUnconfigured(t *testing.T) {
+	isolateGitConfig(t)
 	ctx := context.Background()
 	m := newManager(t)
 	repo := gitRepo(t)
@@ -811,6 +813,7 @@ func TestManager_GetUsesConfiguredDefaultHarness(t *testing.T) {
 }
 
 func TestManager_AddResolvesRemotelessDefaultFromLocalBranch(t *testing.T) {
+	isolateGitConfig(t)
 	ctx := context.Background()
 	m := newManager(t)
 	repo := gitRepoOnBranch(t, "master")
@@ -2684,7 +2687,17 @@ func TestManager_InitializeRepositoryCreateResumesItsOwnFolder(t *testing.T) {
 func TestRemotelessRepoRegistersAndSpawnsWorktree(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("GIT_CEILING_DIRECTORIES", os.TempDir())
-	t.Setenv("PATH", t.TempDir()+string(os.PathListSeparator)+filepath.Dir(mustLookPath(t, "git")))
+	isolateGitConfig(t)
+	// A fake gh and glab first on PATH leave a marker if anything runs them.
+	fakeBin := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "cli-invoked")
+	for _, name := range []string{"gh", "glab"} {
+		script := "#!/bin/sh\necho \"$0 $*\" >> " + marker + "\nexit 1\n"
+		if err := os.WriteFile(filepath.Join(fakeBin, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	for _, key := range []string{"AO_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "BITBUCKET_TOKEN", "GITLAB_TOKEN"} {
 		t.Setenv(key, "")
 	}
@@ -2710,6 +2723,9 @@ func TestRemotelessRepoRegistersAndSpawnsWorktree(t *testing.T) {
 	if registered.DefaultBranch != "main" {
 		t.Fatalf("registered default = %q, want main", registered.DefaultBranch)
 	}
+	if got := strings.TrimSpace(string(mustGitOut(t, repo, "config", "--local", "--get", "ao.defaultBranch"))); got != "main" {
+		t.Fatalf("recorded ao.defaultBranch = %q, want main", got)
+	}
 	ws, err := gitworktree.New(gitworktree.Options{
 		ManagedRoot: t.TempDir(), RepoResolver: gitworktree.StaticRepoResolver{registered.ID: registered.Path},
 	})
@@ -2725,6 +2741,9 @@ func TestRemotelessRepoRegistersAndSpawnsWorktree(t *testing.T) {
 	}
 	if err := ws.Destroy(ctx, info); err != nil {
 		t.Fatalf("finish session: %v", err)
+	}
+	if data, err := os.ReadFile(marker); err == nil {
+		t.Fatalf("gh/glab was invoked on the remoteless path: %s", data)
 	}
 	if strings.Contains(logs.String(), "gh auth") {
 		t.Fatalf("log mentions gh auth: %s", logs.String())
@@ -2755,13 +2774,12 @@ func TestRepoWithRemoteAndNoResolvableDefaultStaysUnresolved(t *testing.T) {
 	}
 }
 
-func mustLookPath(t *testing.T, name string) string {
+// isolateGitConfig hides the developer's global and system git config so a
+// local init.defaultBranch cannot change which default a test resolves.
+func isolateGitConfig(t *testing.T) {
 	t.Helper()
-	p, err := exec.LookPath(name)
-	if err != nil {
-		t.Skipf("%s not on PATH: %v", name, err)
-	}
-	return p
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 }
 
 func mustGitOut(t *testing.T, dir string, args ...string) []byte {
