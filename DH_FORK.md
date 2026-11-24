@@ -26,7 +26,7 @@ Daily job in `scripts/dh-sync/` (full detail, safety model and residual guard ga
 - 2: bad command-line usage.
 - 10: resolved and pushed to a `sync/upstream-*` branch, awaiting land.
 - 20: unresolved: conflict left, resolver made no changes or moved HEAD, conflict markers remain, test-weakening guard tripped, checks still red after the resolver, `claude` rejected its arguments, or resolver-authored build/test config ("NEEDS HUMAN", checks not run, branch pushed for review). `dh/main` is untouched.
-- 30: precondition failure: lock held, not a git repo, `origin`/`upstream` remote missing or the same URL, fetch failed, `main` not fast-forwardable, a push rejected or not matching, worktree could not be created or HEAD moved.
+- 30: precondition failure, including: lock held, not a git repo, `origin`/`upstream` remote missing or the same URL, fetch failed (`upstream` or `origin`), `origin/main` not an ancestor of `upstream/main` (main must only fast-forward), a push rejected (`main`, `dh/main` or `sync/upstream-*`), `origin/dh/main` or `origin/sync/upstream-*` not matching the pushed commit after the push, leftover worktree not removable or worktree could not be created, worktree HEAD detached or moved during the checks. Any `precondition` call in `sync.sh` ends the run with 30.
 
 ### Notifications
 Every notification is appended to `status.log` and shown as a macOS banner; a Slack DM is best effort. Slack "sent" is the Claude session's own SLACK_SENT confirmation and cannot be verified; the banner plus `status.log` are the reliable record (`sync.log` records `notify=sent|sent-no-banner|local-only|osascript-failed`).
@@ -47,7 +47,7 @@ Every notification is appended to `status.log` and shown as a macOS banner; a Sl
 2. Verify: `launchctl print gui/$(id -u)/io.anhermon.ao-sync`. The job runs only while the user is logged in.
 3. The repo path is hard-coded: `REPO=/Users/angelhermon/workspace/agent-orchestrator` at the top of `scripts/dh-sync/sync.sh`. The LaunchAgent passes no `--repo`; change the variable and re-run `install.sh` (manual runs can pass `--repo PATH`).
 4. PATH: launchd gives the job only the PATH set in the plist (`~/.local/bin`, `~/go/bin`, Homebrew, `/usr/local/bin`, system dirs). `claude`, `git`, `go` and `npm` must be reachable there, or the job fails (a missing `golangci-lint` is only SKIPPED).
-5. Manual run: `~/Library/Application Support/ao-sync/sync.sh [--dry-run] [--debug]`.
+5. Manual run: `~/Library/Application Support/ao-sync/sync.sh [--dry-run] [--debug]`. `--dry-run` still fetches `upstream` and `origin` and runs the precondition checks (so it can exit 30 and notify); it stops before any merge or push and exits 0 with `result=noop`.
 6. Remove: `scripts/dh-sync/install.sh --uninstall` removes the LaunchAgent and the copied scripts. Logs stay.
 
 ### Logs

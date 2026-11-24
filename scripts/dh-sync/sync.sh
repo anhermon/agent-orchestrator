@@ -174,7 +174,15 @@ on_exit() {
 on_signal() { # on_signal <exit code>
   warn "received signal, stopping"
   [ -n "$WATCHER" ] && kill_tree "$WATCHER"
-  [ -n "$CHILD" ] && kill_tree "$CHILD"
+  if [ -n "$CHILD" ]; then
+    kill_tree "$CHILD"
+    # Bounded KILL escalation, as in run_limited: a TERM-ignoring grandchild must not outlive us.
+    for _ in 1 2 3 4 5 6; do
+      kill -0 -- "-$CHILD" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -0 -- "-$CHILD" 2>/dev/null && kill -KILL -- "-$CHILD" 2>/dev/null
+  fi
   exit "$1"
 }
 trap on_exit EXIT

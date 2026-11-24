@@ -92,6 +92,7 @@ new_fixture() {
   stub leaky 'sleep 3141.59 & printf "merged\n" >a.txt'
   stub leaky_term "( trap '' TERM; exec sleep 3141.59 ) & printf 'merged\n' >a.txt"
   stub leaky_slow 'sleep 3141.59 & wait'
+  stub slow_term "touch '$T/resolver.started'; ( trap '' TERM; exec sleep 2719.1 ) & sleep 30"
   stub detach "git checkout -q --detach; rm BROKEN; git add -A; git commit -qm fix"
   : >"$T/notify.log"
   export AO_SYNC_LOG_DIR="$T/logs"
@@ -389,6 +390,30 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 check "o: no leftover watcher after SIGTERM" test "$(mine)" = 0
 check "o: no leftover watcher sleep after SIGTERM" test "$(pgrep -f 'sleep 2718$' | wc -l | tr -d ' ')" = 0
+
+# (o2) SIGTERM with a TERM-ignoring grandchild: the group is escalated to KILL (bounded)
+new_fixture
+conflict_setup
+export AO_SYNC_RESOLVER_TIMEOUT=2718
+"$SYNC" --repo "$T/clone" --checks "$T/bin/checks" --resolver "$T/bin/slow_term" --notify "$T/bin/notify" \
+  >"$T/out.log" 2>&1 </dev/null &
+spid=$!
+for _ in $(seq 1 100); do
+  [ -e "$T/resolver.started" ] && break
+  sleep 0.1
+done
+check "o2: resolver started" test -e "$T/resolver.started"
+kill -TERM "$spid"
+wait "$spid"
+rc=$?
+check "o2: exit 143" test "$rc" = 143
+unset AO_SYNC_RESOLVER_TIMEOUT
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(pgrep -f 'sleep 2719.1$' | wc -l | tr -d ' ')" = 0 ] && break
+  sleep 0.5
+done
+check "o2: TERM-ignoring grandchild killed after SIGTERM" test "$(pgrep -f 'sleep 2719.1$' | wc -l | tr -d ' ')" = 0
+pkill -KILL -f 'sleep 2719.1$' 2>/dev/null
 
 new_fixture
 upstream_commit b.txt b "upstream b"
