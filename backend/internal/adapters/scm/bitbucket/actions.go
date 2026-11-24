@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -22,6 +23,27 @@ var (
 	_ ports.SCMReviewRequester = (*Provider)(nil)
 	_ ports.SCMMergeQueuer     = (*Provider)(nil)
 	_ ports.SCMAttachmentStore = (*Provider)(nil)
+	_ providerExtras           = (*Provider)(nil)
+)
+
+// providerExtras are the mutations the provider offers beyond any port, so a
+// signature drift is caught at compile time.
+type providerExtras interface {
+	ApprovePullRequest(ctx context.Context, pr ports.SCMPRRef) error
+	RequestPullRequestChanges(ctx context.Context, pr ports.SCMPRRef) error
+	UnresolveReviewThread(ctx context.Context, request ports.SCMReviewResolveRequest) error
+}
+
+// ErrMergePending reports that Bitbucket accepted a merge but it had not
+// completed when polling stopped. The caller must not record a merge; the
+// observer confirms the state later.
+var ErrMergePending = errors.New("bitbucket scm: merge still pending")
+
+const (
+	// mergePollBudget bounds the total time spent polling an async merge.
+	mergePollBudget = 10 * time.Second
+	// mergePollInterval is the wait between task-status polls.
+	mergePollInterval = 500 * time.Millisecond
 )
 
 // headSHAPattern accepts a full or abbreviated commit hash.
@@ -93,7 +115,7 @@ func mutationError(err error) error {
 // be a prefix of the other.
 func headMatches(live, expected string) bool {
 	live, expected = strings.ToLower(live), strings.ToLower(expected)
-	return live != "" && (strings.HasPrefix(expected, live) || strings.HasPrefix(live, expected))
+	return len(live) >= 7 && (strings.HasPrefix(expected, live) || strings.HasPrefix(live, expected))
 }
 
 // MergePullRequest merges the PR. Bitbucket's merge endpoint has no head SHA
@@ -150,15 +172,94 @@ func (p *Provider) MergePullRequest(ctx context.Context, request ports.SCMMergeR
 	if err != nil {
 		return ports.SCMMergeResult{}, mergeError(err)
 	}
-	if merged.MergeCommit.Hash == "" {
-		if resp != nil && resp.StatusCode == http.StatusAccepted {
-			// Long merges complete asynchronously; the commit is not known yet.
-			p.client.logger.Debug("bitbucket merge accepted asynchronously", "repo", request.PR.Repo.Repo, "number", request.PR.Number)
-			return ports.SCMMergeResult{}, nil
+	if resp != nil && resp.StatusCode == http.StatusAccepted {
+		// Long merges complete asynchronously behind a task-status URL.
+		p.client.logger.Debug("bitbucket merge accepted asynchronously", "repo", request.PR.Repo.Repo, "number", request.PR.Number)
+		if err := p.awaitMergeTask(ctx, resp.Header.Get("Location")); err != nil {
+			return ports.SCMMergeResult{}, err
 		}
-		return ports.SCMMergeResult{}, errors.New("bitbucket scm: merge response missing commit hash")
+		return p.confirmMerged(ctx, path, true)
 	}
-	return ports.SCMMergeResult{MergeCommitSHA: merged.MergeCommit.Hash}, nil
+	if merged.MergeCommit.Hash != "" {
+		return ports.SCMMergeResult{MergeCommitSHA: merged.MergeCommit.Hash}, nil
+	}
+	// A 2xx without a commit (for example a fast-forward) means the merge
+	// happened; confirm it rather than report failure for a merged PR.
+	return p.confirmMerged(ctx, path, false)
+}
+
+// awaitMergeTask polls the task-status URL until it reports a result, the
+// budget is spent (ErrMergePending) or ctx ends. An empty location skips
+// polling so the caller re-reads the PR once.
+func (p *Provider) awaitMergeTask(ctx context.Context, location string) error {
+	if strings.TrimSpace(location) == "" {
+		return nil
+	}
+	ref, err := url.Parse(location)
+	if err != nil {
+		return fmt.Errorf("bitbucket scm: invalid merge task location: %w", err)
+	}
+	taskURL := p.client.baseURL.ResolveReference(ref).String()
+	if err := p.client.checkSameHost(taskURL); err != nil {
+		return err
+	}
+	for waited := time.Duration(0); ; waited += mergePollInterval {
+		var task struct {
+			Status string `json:"task_status"`
+		}
+		if _, err := p.client.doURL(ctx, http.MethodGet, taskURL, nil, &task); err != nil {
+			return mutationError(err)
+		}
+		switch strings.ToUpper(task.Status) {
+		case "SUCCESS":
+			return nil
+		case "FAILED", "ERROR":
+			return fmt.Errorf("%w: merge task %s", ports.ErrSCMRejected, task.Status)
+		}
+		if waited+mergePollInterval > mergePollBudget {
+			return fmt.Errorf("%w: task still %q after %s", ErrMergePending, task.Status, mergePollBudget)
+		}
+		if err := p.sleepFor(ctx, mergePollInterval); err != nil {
+			return err
+		}
+	}
+}
+
+func (p *Provider) sleepFor(ctx context.Context, d time.Duration) error {
+	if p.sleep != nil {
+		return p.sleep(ctx, d)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// confirmMerged re-reads the PR after an accepted merge. MERGED succeeds (the
+// commit hash may be empty); anything else is an error, ErrMergePending when
+// the merge was asynchronous.
+func (p *Provider) confirmMerged(ctx context.Context, path string, async bool) (ports.SCMMergeResult, error) {
+	var pr struct {
+		State       string `json:"state"`
+		MergeCommit struct {
+			Hash string `json:"hash"`
+		} `json:"merge_commit"`
+	}
+	q := url.Values{"fields": {"state,merge_commit.hash"}}
+	if _, err := p.client.do(ctx, http.MethodGet, path, q, nil, &pr); err != nil {
+		return ports.SCMMergeResult{}, mutationError(err)
+	}
+	if strings.EqualFold(pr.State, "MERGED") {
+		return ports.SCMMergeResult{MergeCommitSHA: pr.MergeCommit.Hash}, nil
+	}
+	if async {
+		return ports.SCMMergeResult{}, fmt.Errorf("%w: pull request state is %q", ErrMergePending, pr.State)
+	}
+	return ports.SCMMergeResult{}, fmt.Errorf("bitbucket scm: merge accepted but pull request state is %q", pr.State)
 }
 
 // mergeError classifies a failed merge call: a conflict (409, or 400 whose
@@ -243,7 +344,7 @@ func (p *Provider) ChangePullRequestState(ctx context.Context, request ports.SCM
 	case ports.SCMPRReopen:
 		return fmt.Errorf("%w: bitbucket cannot reopen a declined pull request", ports.ErrSCMUnsupported)
 	case ports.SCMPRReady, ports.SCMPRDraft:
-		return fmt.Errorf("%w: bitbucket has no draft state change %q", ports.ErrSCMUnsupported, request.Action)
+		return fmt.Errorf("%w: bitbucket draft state change %q is not implemented", ports.ErrSCMUnsupported, request.Action)
 	default:
 		return fmt.Errorf("bitbucket scm: unknown pull request state action %q", request.Action)
 	}

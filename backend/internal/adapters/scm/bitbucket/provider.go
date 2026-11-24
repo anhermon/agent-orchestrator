@@ -34,6 +34,8 @@ type Provider struct {
 	// forbiddenWarned records the repos whose commit statuses already produced
 	// the "forbidden" warning, so a polling loop warns once per repo.
 	forbiddenWarned sync.Map
+	// sleep waits between async-merge polls; tests replace it. Nil uses a timer.
+	sleep func(ctx context.Context, d time.Duration) error
 }
 
 // NewProvider creates a Bitbucket Cloud SCM provider. Credentials are resolved

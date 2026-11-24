@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -385,5 +386,292 @@ func TestUnsupportedOperations(t *testing.T) {
 	}
 	if len(srv.calls) != 0 {
 		t.Fatalf("calls = %d, want 0", len(srv.calls))
+	}
+}
+
+// sequence serves responses in order, repeating the last one.
+func sequence(responses ...func(http.ResponseWriter)) func(http.ResponseWriter) {
+	var mu sync.Mutex
+	i := 0
+	return func(w http.ResponseWriter) {
+		mu.Lock()
+		h := responses[min(i, len(responses)-1)]
+		i++
+		mu.Unlock()
+		h(w)
+	}
+}
+
+func withHeader(key, value string, h func(http.ResponseWriter)) func(http.ResponseWriter) {
+	return func(w http.ResponseWriter) {
+		w.Header().Set(key, value)
+		h(w)
+	}
+}
+
+const (
+	taskPath   = "/2.0/repositories/acme/widgets/pullrequests/7/tasks/99"
+	prMerged   = `{"id":7,"state":"MERGED","source":{"commit":{"hash":"0123456789ab"}},"merge_commit":{"hash":"cafe01"}}`
+	prMergedNo = `{"id":7,"state":"MERGED","source":{"commit":{"hash":"0123456789ab"}}}`
+)
+
+// recordSleeps replaces the provider's poll sleep and returns the total slept.
+func recordSleeps(p *Provider) *time.Duration {
+	var total time.Duration
+	p.sleep = func(ctx context.Context, d time.Duration) error {
+		total += d
+		return ctx.Err()
+	}
+	return &total
+}
+
+func mergeReq() ports.SCMMergeRequest {
+	return ports.SCMMergeRequest{PR: testPR, ExpectedHeadSHA: testHeadSHA}
+}
+
+func TestMergeAsyncPollsTaskThenConfirmsMerged(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"GET " + prPath:             sequence(writeJSON(200, prOpen), writeJSON(200, prMerged)),
+		"POST " + prPath + "/merge": withHeader("Location", taskPath, writeJSON(202, ``)),
+		"GET " + taskPath:           sequence(writeJSON(200, `{"task_status":"PENDING"}`), writeJSON(200, `{"task_status":"SUCCESS"}`)),
+	}}
+	p := newTestProvider(t, srv)
+	recordSleeps(p)
+	res, err := p.MergePullRequest(context.Background(), mergeReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.MergeCommitSHA != "cafe01" {
+		t.Fatalf("sha = %q", res.MergeCommitSHA)
+	}
+	if srv.count("POST", prPath+"/merge") != 1 || srv.count("GET", taskPath) != 2 {
+		t.Fatalf("calls = %+v", srv.calls)
+	}
+}
+
+func TestMergeAsyncMergedWithoutHashIsSuccess(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"GET " + prPath:             sequence(writeJSON(200, prOpen), writeJSON(200, prMergedNo)),
+		"POST " + prPath + "/merge": withHeader("Location", taskPath, writeJSON(202, ``)),
+		"GET " + taskPath:           writeJSON(200, `{"task_status":"SUCCESS"}`),
+	}}
+	p := newTestProvider(t, srv)
+	recordSleeps(p)
+	res, err := p.MergePullRequest(context.Background(), mergeReq())
+	if err != nil || res.MergeCommitSHA != "" {
+		t.Fatalf("res = %+v, err = %v", res, err)
+	}
+}
+
+func TestMergeAsyncStillPendingReturnsErrMergePending(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"GET " + prPath:             writeJSON(200, prOpen),
+		"POST " + prPath + "/merge": withHeader("Location", taskPath, writeJSON(202, ``)),
+		"GET " + taskPath:           writeJSON(200, `{"task_status":"PENDING"}`),
+	}}
+	p := newTestProvider(t, srv)
+	slept := recordSleeps(p)
+	_, err := p.MergePullRequest(context.Background(), mergeReq())
+	if !errors.Is(err, ErrMergePending) {
+		t.Fatalf("err = %v, want ErrMergePending", err)
+	}
+	if *slept > 10*time.Second || *slept == 0 {
+		t.Fatalf("slept %v, want 0 < total <= 10s", *slept)
+	}
+}
+
+func TestMergeAsyncNoLocationAndStillOpenIsPending(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"GET " + prPath:             writeJSON(200, prOpen),
+		"POST " + prPath + "/merge": writeJSON(202, ``),
+	}}
+	p := newTestProvider(t, srv)
+	recordSleeps(p)
+	_, err := p.MergePullRequest(context.Background(), mergeReq())
+	if !errors.Is(err, ErrMergePending) {
+		t.Fatalf("err = %v, want ErrMergePending", err)
+	}
+}
+
+func TestMergeAsyncTaskFailedIsError(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"GET " + prPath:             writeJSON(200, prOpen),
+		"POST " + prPath + "/merge": withHeader("Location", taskPath, writeJSON(202, ``)),
+		"GET " + taskPath:           writeJSON(200, `{"task_status":"FAILED"}`),
+	}}
+	p := newTestProvider(t, srv)
+	recordSleeps(p)
+	_, err := p.MergePullRequest(context.Background(), mergeReq())
+	if err == nil || errors.Is(err, ErrMergePending) {
+		t.Fatalf("err = %v, want non-pending error", err)
+	}
+}
+
+func TestMergeAsyncHonoursContext(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"GET " + prPath:             writeJSON(200, prOpen),
+		"POST " + prPath + "/merge": withHeader("Location", taskPath, writeJSON(202, ``)),
+		"GET " + taskPath:           writeJSON(200, `{"task_status":"PENDING"}`),
+	}}
+	p := newTestProvider(t, srv)
+	ctx, cancel := context.WithCancel(context.Background())
+	p.sleep = func(ctx context.Context, d time.Duration) error {
+		cancel()
+		return ctx.Err()
+	}
+	_, err := p.MergePullRequest(ctx, mergeReq())
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrMergePending) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+func TestMergeSyncWithoutHashReconfirms(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"GET " + prPath:             sequence(writeJSON(200, prOpen), writeJSON(200, prMergedNo)),
+		"POST " + prPath + "/merge": writeJSON(200, `{}`),
+	}}
+	p := newTestProvider(t, srv)
+	res, err := p.MergePullRequest(context.Background(), mergeReq())
+	if err != nil || res.MergeCommitSHA != "" {
+		t.Fatalf("res = %+v, err = %v", res, err)
+	}
+}
+
+func TestMergeSyncWithoutHashStillOpenIsError(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"GET " + prPath:             writeJSON(200, prOpen),
+		"POST " + prPath + "/merge": writeJSON(200, `{}`),
+	}}
+	p := newTestProvider(t, srv)
+	_, err := p.MergePullRequest(context.Background(), mergeReq())
+	if err == nil || errors.Is(err, ErrMergePending) {
+		t.Fatalf("err = %v, want non-pending error", err)
+	}
+}
+
+func TestHeadMatches(t *testing.T) {
+	cases := []struct {
+		name, live, expected string
+		want                 bool
+	}{
+		{"full expected, 12-char live", "0123456789ab", testHeadSHA, true},
+		{"7-char expected", testHeadSHA[:12], testHeadSHA[:7], true},
+		{"uppercase expected", "0123456789ab", strings.ToUpper(testHeadSHA), true},
+		{"uppercase live", "0123456789AB", testHeadSHA, true},
+		{"different", "ffffffffffff", testHeadSHA, false},
+		{"empty live", "", testHeadSHA, false},
+		{"live below minimum", "0123", testHeadSHA, false},
+		{"live 6 chars", "012345", testHeadSHA, false},
+	}
+	for _, c := range cases {
+		if got := headMatches(c.live, c.expected); got != c.want {
+			t.Errorf("%s: headMatches(%q,%q) = %v, want %v", c.name, c.live, c.expected, got, c.want)
+		}
+	}
+}
+
+func TestMergeInvalidExpectedHeadMakesNoRequest(t *testing.T) {
+	for _, sha := range []string{"abc123", "zzzzzzzzzzzz", ""} {
+		srv := &actionsServer{routes: map[string]func(http.ResponseWriter){}}
+		p := newTestProvider(t, srv)
+		if _, err := p.MergePullRequest(context.Background(), ports.SCMMergeRequest{PR: testPR, ExpectedHeadSHA: sha}); err == nil {
+			t.Fatalf("sha %q: want error", sha)
+		}
+		if len(srv.calls) != 0 {
+			t.Fatalf("sha %q: calls = %d", sha, len(srv.calls))
+		}
+	}
+}
+
+func TestMergeUnknownMethodMakesNoRequest(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){}}
+	p := newTestProvider(t, srv)
+	_, err := p.MergePullRequest(context.Background(), ports.SCMMergeRequest{PR: testPR, ExpectedHeadSHA: testHeadSHA, Method: "octopus"})
+	if err == nil || len(srv.calls) != 0 {
+		t.Fatalf("err = %v, calls = %d", err, len(srv.calls))
+	}
+}
+
+func TestMergeFailingGetNeverPosts(t *testing.T) {
+	for _, status := range []int{404, 500} {
+		srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+			"GET " + prPath:             writeJSON(status, `{}`),
+			"POST " + prPath + "/merge": writeJSON(200, `{}`),
+		}}
+		p := newTestProvider(t, srv)
+		if _, err := p.MergePullRequest(context.Background(), mergeReq()); err == nil {
+			t.Fatalf("status %d: want error", status)
+		}
+		if n := srv.count("POST", prPath+"/merge"); n != 0 {
+			t.Fatalf("status %d: merge posts = %d", status, n)
+		}
+	}
+}
+
+func TestMergeConflictCaseInsensitive(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"GET " + prPath:             writeJSON(200, prOpen),
+		"POST " + prPath + "/merge": writeJSON(400, `{"error":{"message":"Merge CONFLICT detected"}}`),
+	}}
+	p := newTestProvider(t, srv)
+	_, err := p.MergePullRequest(context.Background(), mergeReq())
+	if !errors.Is(err, ports.ErrSCMNotMergeable) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestThrottledMutationsKeepRateLimitError(t *testing.T) {
+	throttles := map[string]func(http.ResponseWriter){
+		"429":            withHeader("Retry-After", "30", writeJSON(429, `{}`)),
+		"403+RetryAfter": withHeader("Retry-After", "30", writeJSON(403, `{}`)),
+	}
+	for name, throttle := range throttles {
+		srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+			"GET " + prPath:                writeJSON(200, prOpen),
+			"POST " + prPath + "/merge":    throttle,
+			"POST " + prPath + "/comments": throttle,
+		}}
+		p := newTestProvider(t, srv)
+		_, mergeErr := p.MergePullRequest(context.Background(), mergeReq())
+		_, commentErr := p.PostComment(context.Background(), ports.SCMCommentRequest{PR: testPR, Body: "x"})
+		for op, err := range map[string]error{"merge": mergeErr, "comment": commentErr} {
+			var rl *RateLimitError
+			if !errors.As(err, &rl) || rl.GetRetryAfter() != 30*time.Second {
+				t.Fatalf("%s %s: err = %v, want RateLimitError", name, op, err)
+			}
+			if name == "403+RetryAfter" && !errors.Is(err, ports.ErrSCMForbidden) {
+				t.Fatalf("%s %s: want ErrSCMForbidden in chain", name, op)
+			}
+		}
+	}
+}
+
+func TestResolveNonNumericThreadMakesNoRequest(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){}}
+	p := newTestProvider(t, srv)
+	for _, id := range []string{"abc", "", "1/../2"} {
+		if err := p.ResolveReviewThread(context.Background(), ports.SCMReviewResolveRequest{PR: testPR, ThreadID: id}); err == nil {
+			t.Fatalf("id %q: want error", id)
+		}
+		if err := p.UnresolveReviewThread(context.Background(), ports.SCMReviewResolveRequest{PR: testPR, ThreadID: id}); err == nil {
+			t.Fatalf("id %q: want error", id)
+		}
+	}
+	if len(srv.calls) != 0 {
+		t.Fatalf("calls = %d", len(srv.calls))
+	}
+}
+
+func TestPostCommentWhitespaceThreadIsTopLevel(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"POST " + prPath + "/comments": writeJSON(201, `{"id":1,"content":{"raw":"x"}}`),
+	}}
+	p := newTestProvider(t, srv)
+	if _, err := p.PostComment(context.Background(), ports.SCMCommentRequest{PR: testPR, Body: "x", ThreadID: "  "}); err != nil {
+		t.Fatal(err)
+	}
+	call, _ := srv.last("POST", prPath+"/comments")
+	if call.Body != `{"content":{"raw":"x"}}` {
+		t.Fatalf("body = %s", call.Body)
 	}
 }
