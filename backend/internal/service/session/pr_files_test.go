@@ -328,6 +328,42 @@ func TestPRFilesSelectMatchingChildRepository(t *testing.T) {
 	}
 }
 
+func TestPRRevisionFetchKeepsBaseWhenSourceBranchIsHostile(t *testing.T) {
+	for _, branch := range []string{"+x", "a:b", "a b", "../x", "missing"} {
+		t.Run(branch, func(t *testing.T) {
+			dir := t.TempDir()
+			upstream := filepath.Join(dir, "upstream.git")
+			if err := os.MkdirAll(upstream, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, upstream, "init", "--bare")
+			source := newWorkspaceRepo(t)
+			runGit(t, source, "branch", "-M", "main")
+			base := strings.TrimSpace(runGit(t, source, "rev-parse", "HEAD"))
+			runGit(t, source, "push", upstream, "main:refs/heads/main")
+
+			checkout := filepath.Join(dir, "checkout")
+			if err := os.MkdirAll(checkout, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, checkout, "init")
+			runGit(t, checkout, "remote", "add", "origin", upstream)
+
+			pr := domain.PullRequest{Number: 7, Provider: "bitbucket", TargetBranch: "main", SourceBranch: branch, BaseSHA: base, HeadSHA: strings.Repeat("1", 40)}
+			err := ensurePRRevisionObjects(context.Background(), checkout, "origin", pr)
+			if err == nil {
+				t.Fatal("err = nil, want unavailable: the head cannot be fetched")
+			}
+			if !gitCommitExists(context.Background(), checkout, base) {
+				t.Fatal("base revision was lost to the bad source branch")
+			}
+			if strings.TrimSpace(runGit(t, checkout, "for-each-ref", "refs/ao/pr/7/head")) != "" {
+				t.Fatal("a hostile source branch wrote a head ref")
+			}
+		})
+	}
+}
+
 func TestPRFilesFetchBothRevisionsFromMatchingBaseRemote(t *testing.T) {
 	remoteRoot := t.TempDir()
 	upstream := filepath.Join(remoteRoot, "upstream.git")

@@ -168,6 +168,36 @@ func TestResolveRemotelessSurvivesReadOnlyGitConfig(t *testing.T) {
 	}
 }
 
+// A resolver that loses the write race must return what the winner recorded,
+// not its own choice, so every caller agrees on one default.
+func TestResolveRemotelessPrefersConcurrentlyRecordedBranch(t *testing.T) {
+	isolateGitConfig(t)
+	repo := localRepo(t, "main")
+	runGit(t, repo, "branch", "trunk")
+	var failedWrites int
+	racing := func(ctx context.Context, binary string, args ...string) ([]byte, error) {
+		if len(args) == 6 && args[2] == "config" && args[3] == "--local" && args[4] == ManagedDefaultConfigKey {
+			failedWrites++
+			// The concurrent recorder lands first with a different branch.
+			if _, err := runCommand(ctx, binary, "-C", repo, "config", "--local", ManagedDefaultConfigKey, "trunk"); err != nil {
+				return nil, err
+			}
+			return nil, errors.New("could not lock config file")
+		}
+		return runCommand(ctx, binary, args...)
+	}
+	resolution, err := New("", racing).Inspect(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failedWrites != 1 {
+		t.Fatalf("failed writes = %d, want 1", failedWrites)
+	}
+	if resolution.Branch != "trunk" || resolution.Source != SourceAOInitialized {
+		t.Fatalf("resolution = %#v, want the recorded trunk", resolution)
+	}
+}
+
 func TestResolveRemotelessStaysUnresolvedWhenAmbiguous(t *testing.T) {
 	isolateGitConfig(t)
 	repo := localRepo(t, "main")

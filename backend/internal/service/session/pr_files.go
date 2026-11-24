@@ -412,10 +412,14 @@ func ensurePRRevisionObjects(ctx context.Context, root, remote string, pr domain
 			refspecs = append(refspecs, refspec)
 		}
 	}
-	if strings.TrimSpace(remote) != "" && len(refspecs) > 0 {
-		fetchCtx, cancel := context.WithTimeout(ctx, workspaceReviewTimeout)
-		_, _ = gitWorkspaceOutput(fetchCtx, root, append([]string{"fetch", "--no-tags", remote}, refspecs...)...)
-		cancel()
+	if strings.TrimSpace(remote) != "" {
+		// One fetch per ref: git aborts a multi-refspec fetch on the first bad
+		// or missing ref, so a bad source branch must not lose the base.
+		for _, refspec := range refspecs {
+			fetchCtx, cancel := context.WithTimeout(ctx, workspaceReviewTimeout)
+			_, _ = gitWorkspaceOutput(fetchCtx, root, "fetch", "--no-tags", remote, refspec)
+			cancel()
+		}
 	}
 	if !gitCommitExists(ctx, root, pr.BaseSHA) || !gitCommitExists(ctx, root, pr.HeadSHA) {
 		return unavailablePRSource()

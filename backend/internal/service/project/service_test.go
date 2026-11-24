@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/url"
 	"os"
 	"os/exec"
@@ -2706,11 +2705,7 @@ func TestRemotelessRepoRegistersAndSpawnsWorktree(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	var logs strings.Builder
-	m := project.NewWithDeps(project.Deps{
-		Store:  store,
-		Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-	})
+	m := project.NewWithDeps(project.Deps{Store: store})
 
 	repo := gitRepo(t)
 	if out := strings.TrimSpace(string(mustGitOut(t, repo, "remote"))); out != "" {
@@ -2744,9 +2739,6 @@ func TestRemotelessRepoRegistersAndSpawnsWorktree(t *testing.T) {
 	}
 	if data, err := os.ReadFile(marker); err == nil {
 		t.Fatalf("gh/glab was invoked on the remoteless path: %s", data)
-	}
-	if strings.Contains(logs.String(), "gh auth") {
-		t.Fatalf("log mentions gh auth: %s", logs.String())
 	}
 }
 

@@ -2,6 +2,21 @@ package domain
 
 import "testing"
 
+// The Bitbucket adapter tolerates these remotes; the identity parser does not.
+func TestParseRepositoryIdentityRejectsAmbiguousRemotes(t *testing.T) {
+	for _, raw := range []string{
+		"https://bitbucket.org/dealhubio/aura-sre.git?foo=bar",
+		"https://bitbucket.org/dealhubio/aura-sre#readme",
+		"https://github.com/acme/repo?",
+		"bitbucket.org:dealhubio/aura-sre.git",
+		"github.com:acme/repo.git",
+	} {
+		if _, err := ParseRepositoryIdentity(raw); err == nil {
+			t.Fatalf("%q: want error", raw)
+		}
+	}
+}
+
 func TestCanonicalRepositoryValidation(t *testing.T) {
 	for _, tc := range []struct {
 		name, origin, canonical string

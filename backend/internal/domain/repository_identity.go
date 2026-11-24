@@ -36,6 +36,11 @@ func RepositoryProvider(host string) string {
 }
 
 // ParseRepositoryIdentity accepts repository URLs and Git SSH remotes, never PR URLs.
+//
+// It is deliberately stricter than the Bitbucket SCM adapter's ParseRepository:
+// a query or fragment, and an scp-style remote without the "git@" user, are
+// rejected here (the adapter tolerates and strips them). The identity authorizes
+// repositories, so an ambiguous remote must not match one.
 func ParseRepositoryIdentity(raw string) (RepositoryIdentity, error) {
 	invalid := errors.New("expected a repository URL with host and full namespace/repository")
 	if raw == "" || strings.TrimSpace(raw) != raw {
