@@ -19,10 +19,10 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
 
-// startSCMObserver wires the provider-neutral SCM observer with both GitHub
-// GitLab and Bitbucket providers via a multi Provider dispatcher. Missing credentials
-// for one provider do not prevent the other from starting; the observer is
-// disabled only when no provider has usable credentials.
+// startSCMObserver wires the provider-neutral SCM observer with the GitHub,
+// GitLab and Bitbucket providers via a multi Provider dispatcher. Missing
+// credentials for one provider do not prevent the others from starting; the
+// observer is disabled only when no provider has usable credentials.
 func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.Manager, branchStates scmobserve.BranchStateReconciler, gitlabCfg config.GitLabConfig, reviewRefresher *scmReviewRefresher, logger *slog.Logger) <-chan struct{} {
 	var named []scmmulti.NamedProvider
 
@@ -96,9 +96,12 @@ func newGitLabSCMProvider(gitlabCfg config.GitLabConfig, logger *slog.Logger) (*
 }
 
 func logSCMProviderDisabled(logger *slog.Logger, provider string, err error) {
-	if errors.Is(err, scmgithub.ErrNoToken) || errors.Is(err, scmgithub.ErrAuthFailed) ||
+	if errors.Is(err, scmbitbucket.ErrNoCredentials) {
+		// Not configured is the normal state for users of other providers.
+		logger.Debug("scm provider not configured", "provider", provider)
+	} else if errors.Is(err, scmgithub.ErrNoToken) || errors.Is(err, scmgithub.ErrAuthFailed) ||
 		errors.Is(err, scmgitlab.ErrNoToken) || errors.Is(err, scmgitlab.ErrAuthFailed) ||
-		errors.Is(err, scmbitbucket.ErrNoCredentials) || errors.Is(err, scmbitbucket.ErrAuthFailed) {
+		errors.Is(err, scmbitbucket.ErrAuthFailed) {
 		logger.Warn("scm provider disabled: no usable token", "provider", provider, "err", err)
 	} else {
 		logger.Warn("scm provider disabled: setup failed", "provider", provider, "err", err)
@@ -126,7 +129,7 @@ func newMultiSCMProvider(gitlabCfg config.GitLabConfig, logger *slog.Logger) *sc
 }
 
 // newMultiSCMMerger builds a multi-merger for PR merge actions, registering
-// both GitHub and GitLab providers. When one provider is unavailable (missing
+// the GitHub, GitLab and Bitbucket providers. When one provider is unavailable (missing
 // token), the multi-merger still routes to the healthy one — same
 // degrade-gracefully pattern as newMultiSCMProvider. Returns nil when no
 // provider has usable credentials.
