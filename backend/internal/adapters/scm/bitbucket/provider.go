@@ -36,6 +36,8 @@ type Provider struct {
 	forbiddenWarned sync.Map
 	// sleep waits between async-merge polls; tests replace it. Nil uses a timer.
 	sleep func(ctx context.Context, d time.Duration) error
+	// mergeBudget overrides mergePollBudget; tests set it. Zero uses the default.
+	mergeBudget time.Duration
 }
 
 // NewProvider creates a Bitbucket Cloud SCM provider. Credentials are resolved

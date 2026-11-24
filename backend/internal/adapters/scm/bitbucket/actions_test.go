@@ -6,8 +6,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -522,6 +524,48 @@ func TestMergeAsyncHonoursContext(t *testing.T) {
 	_, err := p.MergePullRequest(ctx, mergeReq())
 	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrMergePending) {
 		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+func TestMergeAsyncRefusesTaskLocationOnOtherHost(t *testing.T) {
+	var evilHits atomic.Int32
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		evilHits.Add(1)
+	}))
+	t.Cleanup(evil.Close)
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"GET " + prPath:             writeJSON(200, prOpen),
+		"POST " + prPath + "/merge": withHeader("Location", evil.URL+"/task", writeJSON(202, ``)),
+	}}
+	p := newTestProvider(t, srv)
+	recordSleeps(p)
+	_, err := p.MergePullRequest(context.Background(), mergeReq())
+	if err == nil || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("err = %v, want refusal of the foreign task host", err)
+	}
+	if n := evilHits.Load(); n != 0 {
+		t.Fatalf("foreign host received %d requests, want 0", n)
+	}
+}
+
+func TestMergeAsyncPollBudgetBoundsHungTask(t *testing.T) {
+	srv := &actionsServer{routes: map[string]func(http.ResponseWriter){
+		"GET " + prPath:             writeJSON(200, prOpen),
+		"POST " + prPath + "/merge": withHeader("Location", taskPath, writeJSON(202, ``)),
+	}}
+	hang := make(chan struct{})
+	srv.routes["GET "+taskPath] = func(w http.ResponseWriter) { <-hang }
+	p := newTestProvider(t, srv)
+	// Registered after the server's cleanup so it runs first and frees the handler.
+	t.Cleanup(func() { close(hang) })
+	p.mergeBudget = 100 * time.Millisecond
+	start := time.Now()
+	_, err := p.MergePullRequest(context.Background(), mergeReq())
+	if !errors.Is(err, ErrMergePending) {
+		t.Fatalf("err = %v, want ErrMergePending", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("took %v, want the poll bounded by the budget", elapsed)
 	}
 }
 

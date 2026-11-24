@@ -203,12 +203,25 @@ func (p *Provider) awaitMergeTask(ctx context.Context, location string) error {
 	if err := p.client.checkSameHost(taskURL); err != nil {
 		return err
 	}
+	budget := mergePollBudget
+	if p.mergeBudget > 0 {
+		budget = p.mergeBudget
+	}
+	// The deadline bounds wall time, including a task request that hangs.
+	pollCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	budgetSpent := func(err error) error {
+		if ctx.Err() == nil && pollCtx.Err() != nil {
+			return fmt.Errorf("%w: task not finished within %s", ErrMergePending, budget)
+		}
+		return err
+	}
 	for waited := time.Duration(0); ; waited += mergePollInterval {
 		var task struct {
 			Status string `json:"task_status"`
 		}
-		if _, err := p.client.doURL(ctx, http.MethodGet, taskURL, nil, &task); err != nil {
-			return mutationError(err)
+		if _, err := p.client.doURL(pollCtx, http.MethodGet, taskURL, nil, &task); err != nil {
+			return budgetSpent(mutationError(err))
 		}
 		switch strings.ToUpper(task.Status) {
 		case "SUCCESS":
@@ -216,11 +229,11 @@ func (p *Provider) awaitMergeTask(ctx context.Context, location string) error {
 		case "FAILED", "ERROR":
 			return fmt.Errorf("%w: merge task %s", ports.ErrSCMRejected, task.Status)
 		}
-		if waited+mergePollInterval > mergePollBudget {
-			return fmt.Errorf("%w: task still %q after %s", ErrMergePending, task.Status, mergePollBudget)
+		if waited+mergePollInterval > budget {
+			return fmt.Errorf("%w: task still %q after %s", ErrMergePending, task.Status, budget)
 		}
-		if err := p.sleepFor(ctx, mergePollInterval); err != nil {
-			return err
+		if err := p.sleepFor(pollCtx, mergePollInterval); err != nil {
+			return budgetSpent(err)
 		}
 	}
 }

@@ -25,6 +25,7 @@ func TestParseRepository(t *testing.T) {
 		{"https://bitbucket.org/dealhubio/aura-sre/extra", false, "", ""},
 		{"https://bitbucket.org/dealhubio/.git", false, "", ""},
 		{"", false, "", ""},
+		{`C:\x`, false, "", ""},
 		{"ssh://git@bitbucket.org:7999/dealhubio/aura-sre.git", false, "", ""},
 		{"ssh://git@bitbucket.org:22/dealhubio/aura-sre.git", true, "dealhubio", "dealhubio/aura-sre"},
 		{"https://bitbucket.org:8443/dealhubio/aura-sre.git", false, "", ""},

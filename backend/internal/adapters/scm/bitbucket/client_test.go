@@ -109,6 +109,9 @@ func TestClientErrorMapping(t *testing.T) {
 				t.Fatal("expected error")
 			}
 			c.check(t, err)
+			if (c.status == 401 || c.status == 403) && strings.Count(err.Error(), "bitbucket scm:") != 1 {
+				t.Fatalf("error repeats the prefix: %v", err)
+			}
 			if strings.Contains(err.Error(), testToken) {
 				t.Fatalf("token leaked into error: %v", err)
 			}
@@ -217,6 +220,7 @@ func TestParseRetryAfter(t *testing.T) {
 		{"http-date", now.Add(90 * time.Second).Format(http.TimeFormat), 90 * time.Second},
 		{"past date", now.Add(-time.Minute).Format(http.TimeFormat), 0},
 		{"huge seconds capped", "99999999", time.Hour},
+		{"int64 overflow capped", "99999999999999999999999", time.Hour},
 		{"far future date capped", now.Add(48 * time.Hour).Format(http.TimeFormat), time.Hour},
 		{"negative", "-5", 0},
 		{"garbage", "soon", 0},

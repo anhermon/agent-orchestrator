@@ -50,7 +50,8 @@ func (e *APIError) Unwrap() error { return e.cause }
 func (e *APIError) Error() string {
 	msg := fmt.Sprintf("bitbucket scm: HTTP %d", e.Status)
 	if e.cause != nil {
-		msg += ": " + e.cause.Error()
+		// The sentinels carry their own "bitbucket scm: " prefix.
+		msg += ": " + strings.TrimPrefix(e.cause.Error(), "bitbucket scm: ")
 	}
 	if e.Body != "" {
 		msg += ": " + e.Body
@@ -185,9 +186,9 @@ func (c *client) doURL(ctx context.Context, method, fullURL string, body any, ou
 		}
 		return resp, nil
 	case resp.StatusCode == http.StatusUnauthorized:
-		return resp, fmt.Errorf("bitbucket scm: %s %s: %w", method, req.URL.Path, newAPIError(resp, raw, ErrAuthFailed))
+		return resp, fmt.Errorf("%s %s: %w", method, req.URL.Path, newAPIError(resp, raw, ErrAuthFailed))
 	case resp.StatusCode == http.StatusForbidden:
-		return resp, fmt.Errorf("bitbucket scm: %s %s: %w", method, req.URL.Path, throttleError(newAPIError(resp, raw, ports.ErrSCMForbidden)))
+		return resp, fmt.Errorf("%s %s: %w", method, req.URL.Path, throttleError(newAPIError(resp, raw, ports.ErrSCMForbidden)))
 	default:
 		return resp, throttleError(newAPIError(resp, raw, nil))
 	}
@@ -206,6 +207,15 @@ func newAPIError(resp *http.Response, raw []byte, cause error) *APIError {
 	}
 }
 
+func isAllDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
+}
+
 // parseRetryAfter accepts delay-seconds or an HTTP-date, caps the result at
 // maxRetryAfter, and returns 0 for an empty, invalid or already-past value.
 func parseRetryAfter(value string, now time.Time) time.Duration {
@@ -222,6 +232,9 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 			return maxRetryAfter
 		}
 		d = time.Duration(sec) * time.Second
+	} else if isAllDigits(value) {
+		// Digits that overflow int64 are still a (huge) delay, not garbage.
+		return maxRetryAfter
 	} else if at, err := http.ParseTime(value); err == nil {
 		d = at.Sub(now)
 	}
