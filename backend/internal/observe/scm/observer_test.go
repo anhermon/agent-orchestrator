@@ -4186,3 +4186,32 @@ func TestPoll_RemotelessProjectIsSilentlySkipped(t *testing.T) {
 		t.Fatalf("remoteless project logged at Info or above: %s", logs.String())
 	}
 }
+
+// Positive control for TestPoll_RemotelessProjectIsSilentlySkipped: the same
+// fixture with a GitHub origin must reach the provider, so the skip above is
+// caused by the missing remote and not by an inert fixture.
+func TestPoll_ProjectWithOriginReachesProvider(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, "init", dir)
+	mustGit(t, "-C", dir, "remote", "add", "origin", "https://github.com/o/r.git")
+	store := &fakeStore{
+		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "ao/p-1/root"}}},
+		projects: map[string]domain.ProjectRecord{"p": {ID: "p", Path: dir}},
+		prs:      map[domain.SessionID][]domain.PullRequest{},
+		checks:   map[string][]domain.PullRequestCheck{},
+	}
+	provider := &fakeProvider{
+		identity:   ports.SCMIdentity{Login: "alice", Human: true},
+		repoGuards: map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "origin"}},
+	}
+	obs := New(provider, store, &fakeLifecycle{}, Config{
+		Clock: func() time.Time { return time.Unix(1, 0).UTC() }, Tick: time.Hour, CacheMax: 128, ScopedIdentityResolver: provider,
+		Logger: quietSlog(),
+	})
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if provider.repoGuardCalls == 0 && provider.listCalls == 0 && len(provider.fetchBatches) == 0 {
+		t.Fatal("provider never called for a project with a GitHub origin")
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/exec"
@@ -188,7 +189,7 @@ func TestManager_AddListGetRemove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	if proj.ID != "ao" || proj.Name != "Agent Orchestrator" || proj.Path != repo || proj.DefaultBranch != domain.DefaultBranchAuto {
+	if proj.ID != "ao" || proj.Name != "Agent Orchestrator" || proj.Path != repo || proj.DefaultBranch != "main" {
 		t.Fatalf("Add returned %#v", proj)
 	}
 
@@ -755,8 +756,8 @@ func TestManager_DefaultsWhenUnconfigured(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 
-	// A remoteless project stays in automatic mode instead of deriving a default
-	// from its current checkout. The empty config remains unpersisted.
+	// A remoteless project resolves its default locally. The empty config
+	// remains unpersisted; the branch is recorded in the repository itself.
 	got, err := m.Get(ctx, "ao")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -764,8 +765,8 @@ func TestManager_DefaultsWhenUnconfigured(t *testing.T) {
 	if got.Project == nil {
 		t.Fatalf("Get returned no project: %#v", got)
 	}
-	if got.Project.DefaultBranch != domain.DefaultBranchAuto {
-		t.Fatalf("default branch = %q, want %q", got.Project.DefaultBranch, domain.DefaultBranchAuto)
+	if got.Project.DefaultBranch != "main" {
+		t.Fatalf("default branch = %q, want main", got.Project.DefaultBranch)
 	}
 	if got.Project.Agent != "claude-code" {
 		t.Fatalf("default agent = %q, want claude-code", got.Project.Agent)
@@ -809,7 +810,7 @@ func TestManager_GetUsesConfiguredDefaultHarness(t *testing.T) {
 	}
 }
 
-func TestManager_AddDoesNotTreatCurrentBranchAsAutomaticDefault(t *testing.T) {
+func TestManager_AddResolvesRemotelessDefaultFromLocalBranch(t *testing.T) {
 	ctx := context.Background()
 	m := newManager(t)
 	repo := gitRepoOnBranch(t, "master")
@@ -818,9 +819,9 @@ func TestManager_AddDoesNotTreatCurrentBranchAsAutomaticDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	// A lone local branch is not authoritative default-branch metadata.
-	if proj.DefaultBranch != domain.DefaultBranchAuto {
-		t.Fatalf("DefaultBranch = %q, want auto", proj.DefaultBranch)
+	// With no remote, the checked-out local branch is the default.
+	if proj.DefaultBranch != "master" {
+		t.Fatalf("DefaultBranch = %q, want master", proj.DefaultBranch)
 	}
 	if proj.Config != nil {
 		t.Fatalf("automatic branch selection should not pin config, got %#v", proj.Config)
@@ -830,8 +831,8 @@ func TestManager_AddDoesNotTreatCurrentBranchAsAutomaticDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if got.Project == nil || got.Project.DefaultBranch != domain.DefaultBranchAuto {
-		t.Fatalf("Get DefaultBranch = %#v, want auto", got.Project)
+	if got.Project == nil || got.Project.DefaultBranch != "master" {
+		t.Fatalf("Get DefaultBranch = %#v, want master", got.Project)
 	}
 
 	// An explicit config wins over detection.
@@ -2675,4 +2676,99 @@ func TestManager_InitializeRepositoryCreateResumesItsOwnFolder(t *testing.T) {
 		_, err := m.InitializeRepository(ctx, project.InitializeRepositoryInput{Path: newFolder(t), Create: true, CreateID: "--global"})
 		wantCode(t, err, "INVALID_CREATE_ID")
 	})
+}
+
+// A plain "git init" repository with no remote and no recorded default must
+// register and spawn a session worktree on its local branch, without a
+// configured BaseBranch and without touching gh/glab auth.
+func TestRemotelessRepoRegistersAndSpawnsWorktree(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("GIT_CEILING_DIRECTORIES", os.TempDir())
+	t.Setenv("PATH", t.TempDir()+string(os.PathListSeparator)+filepath.Dir(mustLookPath(t, "git")))
+	for _, key := range []string{"AO_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "BITBUCKET_TOKEN", "GITLAB_TOKEN"} {
+		t.Setenv(key, "")
+	}
+	store, err := sqlitetest.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var logs strings.Builder
+	m := project.NewWithDeps(project.Deps{
+		Store:  store,
+		Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+
+	repo := gitRepo(t)
+	if out := strings.TrimSpace(string(mustGitOut(t, repo, "remote"))); out != "" {
+		t.Fatalf("fixture has remotes %q", out)
+	}
+	registered, err := m.Add(ctx, project.AddInput{Path: repo})
+	if err != nil {
+		t.Fatalf("add remoteless project: %v", err)
+	}
+	if registered.DefaultBranch != "main" {
+		t.Fatalf("registered default = %q, want main", registered.DefaultBranch)
+	}
+	ws, err := gitworktree.New(gitworktree.Options{
+		ManagedRoot: t.TempDir(), RepoResolver: gitworktree.StaticRepoResolver{registered.ID: registered.Path},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := ws.Create(ctx, ports.WorkspaceConfig{ProjectID: registered.ID, SessionID: "first", Branch: "ao/first/root"})
+	if err != nil {
+		t.Fatalf("spawn in remoteless repo: %v", err)
+	}
+	if got := strings.TrimSpace(string(mustGitOut(t, info.Path, "rev-parse", "--abbrev-ref", "HEAD"))); got != "ao/first/root" {
+		t.Fatalf("worktree branch = %q, want ao/first/root", got)
+	}
+	if err := ws.Destroy(ctx, info); err != nil {
+		t.Fatalf("finish session: %v", err)
+	}
+	if strings.Contains(logs.String(), "gh auth") {
+		t.Fatalf("log mentions gh auth: %s", logs.String())
+	}
+}
+
+// With a remote that exposes no HEAD, the remoteless fallback must not apply:
+// the default stays unresolved.
+func TestRepoWithRemoteAndNoResolvableDefaultStaysUnresolved(t *testing.T) {
+	m := newManager(t)
+	repo := gitRepoWithOrigin(t, "https://example.invalid/project.git")
+	registered, err := m.Add(context.Background(), project.AddInput{Path: repo})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if registered.DefaultBranch != domain.DefaultBranchAuto {
+		t.Fatalf("default = %q, want %q for a remote with no cached HEAD", registered.DefaultBranch, domain.DefaultBranchAuto)
+	}
+	ws, err := gitworktree.New(gitworktree.Options{
+		ManagedRoot: t.TempDir(), RepoResolver: gitworktree.StaticRepoResolver{registered.ID: registered.Path},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ws.Create(context.Background(), ports.WorkspaceConfig{ProjectID: registered.ID, SessionID: "s", Branch: "ao/s/root"})
+	if !errors.Is(err, ports.ErrWorkspaceDefaultBranchUnresolved) {
+		t.Fatalf("create error = %v, want ErrWorkspaceDefaultBranchUnresolved", err)
+	}
+}
+
+func mustLookPath(t *testing.T, name string) string {
+	t.Helper()
+	p, err := exec.LookPath(name)
+	if err != nil {
+		t.Skipf("%s not on PATH: %v", name, err)
+	}
+	return p
+}
+
+func mustGitOut(t *testing.T, dir string, args ...string) []byte {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v (%s)", args, err, out)
+	}
+	return out
 }

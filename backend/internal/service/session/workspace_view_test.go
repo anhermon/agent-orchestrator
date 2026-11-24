@@ -145,7 +145,12 @@ func TestBranchViewWithoutDefaultBranchStartsAtTheRootCommit(t *testing.T) {
 	runGit(t, repo, "switch", "-c", "feature")
 	tip := commitWorkspaceFile(t, repo, "feature.txt", "feature\n", "add feature")
 	runGit(t, repo, "switch", "main")
-	// No project and no remote: nothing names a default branch to measure from.
+	// No project, no remote and no unambiguous local default (two conventional
+	// branches, detached HEAD): nothing names a default branch to measure from.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	runGit(t, repo, "branch", "master")
+	runGit(t, repo, "checkout", "--detach")
 	svc := workspaceReviewService(t, repo)
 
 	history, err := svc.GetWorkspaceHistory(context.Background(), "ao-1", WorkspaceView{Branch: "feature"})

@@ -97,7 +97,7 @@ func (r *Resolver) Inspect(ctx context.Context, repo string) (Resolution, error)
 		return Resolution{}, err
 	}
 	if len(remotes) == 0 {
-		return r.resolveAOInitialized(ctx, repo)
+		return r.resolveRemoteless(ctx, repo)
 	}
 	if cached, ok := r.cachedRemoteHead(ctx, repo, remote); ok {
 		return cached, nil
@@ -142,7 +142,7 @@ func (r *Resolver) Resolve(ctx, remoteCtx context.Context, repo string) (Resolut
 		return Resolution{}, err
 	}
 	if len(remotes) == 0 {
-		return r.resolveAOInitialized(ctx, repo)
+		return r.resolveRemoteless(ctx, repo)
 	}
 	if remoteCtx == nil {
 		remoteCtx = ctx
@@ -327,6 +327,56 @@ func (r *Resolver) resolveAOInitialized(ctx context.Context, repo string) (Resol
 		)
 	}
 	return Resolution{Branch: branch, Ref: ref, Source: SourceAOInitialized}, nil
+}
+
+// resolveRemoteless resolves the default of a repository with no remote at
+// all, where there is no remote HEAD to consult. It prefers the branch AO
+// recorded; otherwise it falls back to local state: the checked-out branch,
+// then init.defaultBranch, then the single existing one of main/master. The
+// choice is recorded so later checkouts do not move the default. A repository
+// with a remote never takes this path.
+func (r *Resolver) resolveRemoteless(ctx context.Context, repo string) (Resolution, error) {
+	resolved, err := r.resolveAOInitialized(ctx, repo)
+	if err == nil || !errors.Is(err, ErrUnresolved) {
+		return resolved, err
+	}
+	if out, cfgErr := r.run(ctx, r.binary, "-C", repo, "config", "--local", "--get", ManagedDefaultConfigKey); cfgErr == nil && strings.TrimSpace(string(out)) != "" {
+		return Resolution{}, err
+	}
+	branch, ok := r.localDefaultBranch(ctx, repo)
+	if !ok {
+		return Resolution{}, err
+	}
+	if _, cfgErr := r.run(ctx, r.binary, "-C", repo, "config", "--local", ManagedDefaultConfigKey, branch); cfgErr != nil {
+		return Resolution{}, fmt.Errorf("record %s for repository %q: %w", ManagedDefaultConfigKey, repo, cfgErr)
+	}
+	return Resolution{Branch: branch, Ref: "refs/heads/" + branch, Source: SourceAOInitialized}, nil
+}
+
+func (r *Resolver) localDefaultBranch(ctx context.Context, repo string) (string, bool) {
+	usable := func(branch string) bool {
+		return branch != "" && r.validateBranch(ctx, repo, branch) == nil && r.refExists(ctx, repo, "refs/heads/"+branch)
+	}
+	if out, err := r.run(ctx, r.binary, "-C", repo, "symbolic-ref", "--quiet", "--short", "HEAD"); err == nil {
+		if branch := strings.TrimSpace(string(out)); usable(branch) {
+			return branch, true
+		}
+	}
+	if out, err := r.run(ctx, r.binary, "-C", repo, "config", "--get", "init.defaultBranch"); err == nil {
+		if branch := strings.TrimSpace(string(out)); usable(branch) {
+			return branch, true
+		}
+	}
+	var found []string
+	for _, branch := range []string{"main", "master"} {
+		if usable(branch) {
+			found = append(found, branch)
+		}
+	}
+	if len(found) == 1 {
+		return found[0], true
+	}
+	return "", false
 }
 
 // legacyAOInitializedBranch recognizes the two initial commits written by AO

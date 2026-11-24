@@ -58,9 +58,70 @@ func TestResolveFallsBackToCachedHeadWhenRemoteIsOffline(t *testing.T) {
 	}
 }
 
-func TestResolveNeverFallsBackToCurrentOrConventionalBranch(t *testing.T) {
+func TestResolveRemotelessUsesCurrentBranchAndRecordsIt(t *testing.T) {
 	repo := localRepo(t, "main")
 	runGit(t, repo, "switch", "-c", "feature/temporary")
+
+	resolution, err := New("", nil).Resolve(context.Background(), context.Background(), repo)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolution.Branch != "feature/temporary" || resolution.Ref != "refs/heads/feature/temporary" || resolution.Remote != "" {
+		t.Fatalf("resolution = %#v, want local feature/temporary", resolution)
+	}
+	runGit(t, repo, "switch", "main")
+	again, err := New("", nil).Inspect(context.Background(), repo)
+	if err != nil || again.Branch != "feature/temporary" {
+		t.Fatalf("Inspect after checkout change = %#v, %v, want the recorded branch", again, err)
+	}
+}
+
+func TestResolveRemotelessFallsBackToInitDefaultBranchThenSingleConventionalBranch(t *testing.T) {
+	detached := func(t *testing.T, repo string) {
+		runGit(t, repo, "checkout", "--detach")
+	}
+	cases := []struct {
+		name  string
+		setup func(t *testing.T) string
+		want  string
+	}{
+		{"init.defaultBranch when HEAD is detached", func(t *testing.T) string {
+			repo := localRepo(t, "trunk")
+			runGit(t, repo, "branch", "main")
+			runGit(t, repo, "config", "init.defaultBranch", "trunk")
+			detached(t, repo)
+			return repo
+		}, "trunk"},
+		{"single main", func(t *testing.T) string {
+			repo := localRepo(t, "main")
+			detached(t, repo)
+			return repo
+		}, "main"},
+		{"single master", func(t *testing.T) string {
+			repo := localRepo(t, "master")
+			detached(t, repo)
+			return repo
+		}, "master"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resolution, err := New("", nil).Resolve(context.Background(), context.Background(), tc.setup(t))
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if resolution.Branch != tc.want {
+				t.Fatalf("branch = %q, want %q", resolution.Branch, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveRemotelessStaysUnresolvedWhenAmbiguous(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	repo := localRepo(t, "main")
+	runGit(t, repo, "branch", "master")
+	runGit(t, repo, "checkout", "--detach")
 
 	_, err := New("", nil).Resolve(context.Background(), context.Background(), repo)
 	if !errors.Is(err, ErrUnresolved) {
@@ -68,6 +129,16 @@ func TestResolveNeverFallsBackToCurrentOrConventionalBranch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no remote or Orchestrator-recorded default") {
 		t.Fatalf("Resolve error = %v, want missing authoritative metadata detail", err)
+	}
+}
+
+func TestResolveWithRemoteNeverFallsBackToCurrentBranch(t *testing.T) {
+	repo := localRepo(t, "main")
+	runGit(t, repo, "remote", "add", "origin", filepath.Join(t.TempDir(), "missing.git"))
+
+	_, err := New("", nil).Resolve(context.Background(), context.Background(), repo)
+	if !errors.Is(err, ErrUnresolved) {
+		t.Fatalf("Resolve error = %v, want ErrUnresolved", err)
 	}
 }
 

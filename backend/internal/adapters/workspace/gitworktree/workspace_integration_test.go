@@ -497,6 +497,9 @@ func TestWorkspaceIntegrationRestoreExistingBranchDoesNotResolveDefault(t *testi
 	// only needs to reattach it and must not attempt automatic default
 	// resolution again.
 	runGit(t, git, repo, "remote", "remove", "origin")
+	// Remoteless repos fall back to the local branch, so make that unresolvable.
+	runGit(t, git, repo, "checkout", "--detach")
+	runGit(t, git, repo, "branch", "-m", "main", "trunk")
 	_, err = ws.Create(ctx, ports.WorkspaceConfig{ProjectID: "proj", SessionID: "probe", Branch: "feature/new"})
 	if !errors.Is(err, ports.ErrWorkspaceDefaultBranchUnresolved) {
 		t.Fatalf("Create without remote metadata error = %v, want ErrWorkspaceDefaultBranchUnresolved", err)
@@ -982,9 +985,11 @@ func TestWorkspaceIntegrationAddNewBranchRecoversStaleRegistration(t *testing.T)
 }
 
 // TestWorkspaceIntegrationAutoRejectsUnmarkedRemotelessRepo proves automatic
-// selection never silently treats the active (or conventionally named) local
-// branch as the repository default.
+// selection stays unresolved when a remoteless repo has no unambiguous local
+// default, and that a repo with a remote never falls back to local branches.
 func TestWorkspaceIntegrationAutoRejectsUnmarkedRemotelessRepo(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	git := requireGit(t)
 	tmp := t.TempDir()
 	repo := filepath.Join(tmp, "unmarked")
@@ -1005,6 +1010,10 @@ func TestWorkspaceIntegrationAutoRejectsUnmarkedRemotelessRepo(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 	ctx := context.Background()
+	// With no remote, the checked-out branch is the local default (see
+	// gitdefault.resolveRemoteless). Ambiguous local state stays unresolved.
+	runGit(t, git, repo, "checkout", "--detach")
+	runGit(t, git, repo, "branch", "master")
 	_, err = ws.Create(ctx, ports.WorkspaceConfig{ProjectID: "proj", SessionID: "sess", Branch: "ao/proj-1"})
 	if !errors.Is(err, ports.ErrWorkspaceDefaultBranchUnresolved) {
 		t.Fatalf("Create error = %v, want ErrWorkspaceDefaultBranchUnresolved", err)
@@ -1015,6 +1024,8 @@ func TestWorkspaceIntegrationAutoRejectsUnmarkedRemotelessRepo(t *testing.T) {
 	if out, err := exec.Command(git, "-C", repo, "show-ref", "--verify", "--quiet", "refs/heads/ao/proj-1").CombinedOutput(); err == nil {
 		t.Fatalf("unresolved auto selection leaked a session branch: %s", out)
 	}
+	runGit(t, git, repo, "branch", "-D", "master")
+	runGit(t, git, repo, "switch", "feature/temporary")
 
 	// With a remote that advertises no HEAD, the remote HEAD is the thing to fix.
 	runGit(t, git, repo, "remote", "add", "origin", filepath.Join(tmp, "missing.git"))
