@@ -169,7 +169,7 @@ func mergePRFacts(current, next domain.PRFacts) domain.PRFacts {
 func pullRequestAliasKey(rawURL string, number int, sourceBranch, targetBranch, headSHA string) string {
 	host, owner, repoName, parsedNumber, ok := githubPRURLIdentity(rawURL)
 	if !ok {
-		return ""
+		return bitbucketPRAliasKey(rawURL, number)
 	}
 	if number != 0 && parsedNumber != 0 && number != parsedNumber {
 		return ""
@@ -199,6 +199,15 @@ func normalizedAliasPart(value string) string {
 // lookup do: case matters, so feat/Base is not feat/base.
 func sameTargetBranch(a, b string) bool {
 	return strings.TrimSpace(a) == strings.TrimSpace(b)
+}
+
+func bitbucketPRAliasKey(rawURL string, number int) string {
+	ref, err := domain.ParseChangeRequestURL(strings.TrimSpace(rawURL))
+	if err != nil || ref.Provider != "bitbucket" || (number != 0 && number != ref.Number) {
+		return ""
+	}
+	owner, repoName, _ := strings.Cut(strings.ToLower(ref.Repository), "/")
+	return strings.Join([]string{"bitbucket", ref.Host, owner, repoName, strconv.Itoa(ref.Number)}, "|")
 }
 
 func githubPRURLIdentity(raw string) (host, owner, repoName string, number int, ok bool) {

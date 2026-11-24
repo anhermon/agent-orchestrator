@@ -26,6 +26,9 @@ func RepositoryProvider(host string) string {
 		host = hostname
 	}
 	host = strings.ToLower(host)
+	if host == "bitbucket.org" {
+		return "bitbucket"
+	}
 	if host == "github.com" || host == "www.github.com" || host == "api.github.com" || strings.HasSuffix(host, ".github.com") || strings.HasSuffix(host, ".ghe.io") {
 		return "github"
 	}
@@ -72,7 +75,7 @@ func ParseRepositoryIdentity(raw string) (RepositoryIdentity, error) {
 		}
 	}
 	provider := RepositoryProvider(u.Hostname())
-	if provider == "github" && len(parts) != 2 {
+	if (provider == "github" || provider == "bitbucket") && len(parts) != 2 {
 		return RepositoryIdentity{}, invalid
 	}
 	return RepositoryIdentity{Provider: provider, Host: strings.ToLower(u.Host), Namespace: strings.Join(parts[:len(parts)-1], "/"), Name: parts[len(parts)-1]}, nil

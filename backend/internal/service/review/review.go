@@ -397,6 +397,9 @@ func providerFromPRURL(raw string) string {
 	if strings.Contains(raw, "/pull/") {
 		return "github"
 	}
+	if strings.Contains(raw, "/pull-requests/") {
+		return "bitbucket"
+	}
 	return ""
 }
 

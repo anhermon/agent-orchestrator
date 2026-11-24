@@ -143,6 +143,10 @@ func InferTrackerProvider(repoURL string) TrackerProvider {
 		return TrackerProviderGitHub
 	}
 	host := strings.TrimPrefix(strings.ToLower(parsed.Hostname()), "www.")
+	if host == "bitbucket.org" {
+		// Bitbucket has no tracker integration; callers treat "" as unsupported.
+		return ""
+	}
 	if host == "github.com" || strings.HasSuffix(host, ".github.com") || strings.HasSuffix(host, ".ghe.io") {
 		return TrackerProviderGitHub
 	}

@@ -19,3 +19,13 @@ TBD: location of the job that fast-forwards `main` from upstream and merges it i
 | --- | --- | --- | --- |
 | backend/internal/daemon/scm_wiring.go | startSCMObserver, newMultiSCMProvider, newMultiSCMMerger | Register the bitbucket provider/merger after the gitlab block (one block per site) | 4 |
 | backend/internal/daemon/scm_wiring.go | logSCMProviderDisabled | Treat bitbucket ErrNoCredentials/ErrAuthFailed as the "no usable token" warning | 4 |
+| backend/internal/domain/repository_identity.go | RepositoryProvider, ParseRepositoryIdentity | bitbucket.org maps to provider "bitbucket"; namespace must be exactly workspace/slug | 5 |
+| backend/internal/domain/change_request.go | ParseChangeRequestURL | Parse /ws/slug/pull-requests/N (optional /diff, /commits, /overview) as provider "bitbucket" | 5 |
+| backend/internal/domain/tracker.go | InferTrackerProvider | bitbucket.org returns empty provider (no tracker) instead of falling through to gitlab | 5 |
+| backend/internal/observe/trackerintake/observer.go | trackerRepo | Empty inferred provider means unsupported tracker; skip the repo | 5 |
+| backend/internal/service/session/claim_pr.go | prURLFromParts, parsePRURL, parseBitbucketPRURL | Accept and build Bitbucket PR URLs so a session can claim its PR | 5 |
+| backend/internal/service/session/pr_alias.go | pullRequestAliasKey, bitbucketPRAliasKey | Alias key bitbucket|host|ws|slug|n | 5 |
+| backend/internal/service/review/review.go | providerFromPRURL | /pull-requests/ URLs resolve to provider "bitbucket" | 5 |
+
+### Known GitHub-only (left untouched)
+reviewgateway/gateway.go, cli/pr_ref.go, cli/triage_*, githubpat, importer, telemetry, copilot reviewer, trackerintake (beyond the empty-provider guard), cli/spawn.go --tracker-provider, lifecycle/review_done.go (review anchor is a GitHub-only feature; Bitbucket gets the "Review ID" fallback), service/session/pr_summary.go (the "github" default stays; the Bitbucket observer sets Provider).

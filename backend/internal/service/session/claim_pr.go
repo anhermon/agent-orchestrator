@@ -472,6 +472,9 @@ func prURLFromParts(host, owner, repo string, number int) string {
 	if providerKey(host) == "github" {
 		return fmt.Sprintf("https://%s/%s/%s/pull/%d", host, owner, repo, number)
 	}
+	if providerKey(host) == "bitbucket" {
+		return fmt.Sprintf("https://%s/%s/%s/pull-requests/%d", host, owner, repo, number)
+	}
 	return fmt.Sprintf("https://%s/%s/%s/-/merge_requests/%d", host, owner, repo, number)
 }
 
@@ -511,6 +514,10 @@ func parsePRURL(raw string) (host, owner, name string, number int, err error) {
 	host = u.Host
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 
+	if providerKey(host) == "bitbucket" {
+		return parseBitbucketPRURL(u)
+	}
+
 	// GitHub: /owner/repo/pull/N → 4 parts, parts[2] == "pull"
 	if providerKey(host) == "github" && len(parts) == 4 && parts[2] == "pull" {
 		n, parseErr := strconv.Atoi(parts[3])
@@ -544,6 +551,17 @@ func parsePRURL(raw string) (host, owner, name string, number int, err error) {
 	}
 
 	return "", "", "", 0, ErrInvalidPRRef
+}
+
+// parseBitbucketPRURL reuses the domain parser so claim and observe agree on
+// what a Bitbucket PR URL is.
+func parseBitbucketPRURL(u *url.URL) (host, owner, name string, number int, err error) {
+	ref, perr := domain.ParseChangeRequestURL(u.String())
+	if perr != nil || ref.Provider != "bitbucket" {
+		return "", "", "", 0, ErrInvalidPRRef
+	}
+	owner, name, _ = strings.Cut(ref.Repository, "/")
+	return ref.Host, owner, name, ref.Number, nil
 }
 
 func repoFromURL(raw string) (host, owner, name string, err error) {

@@ -336,6 +336,9 @@ func trackerRepo(project domain.ProjectRecord, cfg domain.TrackerIntakeConfig) (
 	if provider == "" {
 		provider = domain.InferTrackerProvider(project.RepoOriginURL)
 	}
+	if provider == "" {
+		return domain.TrackerRepo{}, false
+	}
 	native := strings.TrimSpace(cfg.Repo)
 	if native == "" {
 		native, _ = parseRepoNative(project.RepoOriginURL, provider)

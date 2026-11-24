@@ -34,6 +34,9 @@ type RepositoryRename struct {
 	Name    string
 }
 
+// bitbucketPRViews are the tab suffixes Bitbucket appends to a PR web URL.
+var bitbucketPRViews = map[string]bool{"diff": true, "commits": true, "overview": true}
+
 // ParseChangeRequestURL accepts complete GitHub PR and GitLab MR web URLs.
 // It never fetches the URL or grants SCM tracking authority.
 func ParseChangeRequestURL(raw string) (ChangeRequestReference, error) {
@@ -53,9 +56,14 @@ func ParseChangeRequestURL(raw string) (ChangeRequestReference, error) {
 	if provider == "github" && u.Port() != "" {
 		return ChangeRequestReference{}, ErrInvalidChangeRequestURL
 	}
+	if provider == "bitbucket" && u.Port() != "" {
+		return ChangeRequestReference{}, ErrInvalidChangeRequestURL
+	}
 	var repoParts []string
 	var numberText string
 	switch {
+	case provider == "bitbucket" && len(parts) >= 4 && parts[2] == "pull-requests" && (len(parts) == 4 || len(parts) == 5 && bitbucketPRViews[parts[4]]):
+		repoParts, numberText = parts[:2], parts[3]
 	case provider == "github" && len(parts) == 4 && parts[2] == "pull":
 		repoParts, numberText = parts[:2], parts[3]
 	case provider == "gitlab" && len(parts) >= 5 && parts[len(parts)-3] == "-" && parts[len(parts)-2] == "merge_requests":
@@ -83,6 +91,9 @@ func ParseChangeRequestURL(raw string) (ChangeRequestReference, error) {
 	path := "/" + name + "/pull/" + strconv.Itoa(number)
 	if provider == "gitlab" {
 		path = "/" + name + "/-/merge_requests/" + strconv.Itoa(number)
+	}
+	if provider == "bitbucket" {
+		path = "/" + name + "/pull-requests/" + strconv.Itoa(number)
 	}
 	return ChangeRequestReference{URL: u.Scheme + "://" + host + path, Provider: provider, Host: host, Repository: name, Number: number}, nil
 }
