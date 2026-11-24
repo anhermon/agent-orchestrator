@@ -4155,3 +4155,34 @@ func TestPrepareForPersistenceCountsQueueOnlyChange(t *testing.T) {
 		t.Fatal("a moved queue position was not counted as a change")
 	}
 }
+
+// A local-only repository (no remote) must degrade cleanly: no provider calls
+// and nothing above Debug in the log.
+func TestPoll_RemotelessProjectIsSilentlySkipped(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, "init", dir)
+	store := &fakeStore{
+		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "ao/p-1/root"}}},
+		projects: map[string]domain.ProjectRecord{"p": {ID: "p", Path: dir}},
+		prs:      map[domain.SessionID][]domain.PullRequest{},
+		checks:   map[string][]domain.PullRequestCheck{},
+	}
+	provider := &fakeProvider{identity: ports.SCMIdentity{Login: "alice", Human: true}}
+	var logs bytes.Buffer
+	obs := New(provider, store, &fakeLifecycle{}, Config{
+		Clock: func() time.Time { return time.Unix(1, 0).UTC() }, Tick: time.Hour, CacheMax: 128, ScopedIdentityResolver: provider,
+		Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if provider.repoGuardCalls != 0 || provider.listCalls != 0 || len(provider.fetchBatches) != 0 {
+		t.Fatalf("provider called for remoteless project: guards=%d lists=%d fetches=%d", provider.repoGuardCalls, provider.listCalls, len(provider.fetchBatches))
+	}
+	if len(store.writes) != 0 {
+		t.Fatalf("writes = %d, want none", len(store.writes))
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("remoteless project logged at Info or above: %s", logs.String())
+	}
+}

@@ -1902,3 +1902,50 @@ func TestWorkspaceIntegrationDestroyStaleAddLockStillPreservesDirtyWork(t *testi
 		t.Fatalf("dirty work lost: %v", err)
 	}
 }
+
+// A repository with no remote at all is a supported local-only setup: when the
+// default branch is configured, a session worktree is created from the local
+// branch without any fetch, and teardown works.
+func TestWorkspaceIntegrationRemotelessRepoWithConfiguredBranchCreatesWorktree(t *testing.T) {
+	git := requireGit(t)
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, git, "init", "-b", "main", repo)
+	runGit(t, git, repo, "config", "core.autocrlf", "false")
+	runGit(t, git, repo, "config", "user.email", "ao@example.com")
+	runGit(t, git, repo, "config", "user.name", "Ao Agents")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("seed\n"), 0o644); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	runGit(t, git, repo, "add", "README.md")
+	runGit(t, git, repo, "commit", "-m", "seed")
+	if remotes := gitOutput(t, git, repo, "remote"); remotes != "" {
+		t.Fatalf("fixture has remotes %q, want none", remotes)
+	}
+
+	ws, err := New(Options{Binary: git, ManagedRoot: filepath.Join(tmp, "managed"), RepoResolver: StaticRepoResolver{"proj": repo}})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ctx := context.Background()
+	target, err := ws.ResolveDefaultBranch(ctx, repo, "main")
+	if err != nil {
+		t.Fatalf("resolve configured default: %v", err)
+	}
+	if target.BaseRef != "refs/heads/main" || target.Fetched {
+		t.Fatalf("target = %#v, want local refs/heads/main without fetch", target)
+	}
+	if err := ws.FetchDefaultBranch(ctx, repo, target); err != nil {
+		t.Fatalf("fetch default branch without remote: %v", err)
+	}
+	info, err := ws.Create(ctx, ports.WorkspaceConfig{ProjectID: "proj", SessionID: "sess", Branch: "ao/proj-1/root", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("create in remoteless repo: %v", err)
+	}
+	if got := gitOutput(t, git, info.Path, "rev-parse", "--abbrev-ref", "HEAD"); got != "ao/proj-1/root" {
+		t.Fatalf("worktree branch = %q, want ao/proj-1/root", got)
+	}
+	if err := ws.Destroy(ctx, info); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+}
