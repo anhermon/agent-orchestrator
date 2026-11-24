@@ -70,8 +70,10 @@ NOTIFY_STATUS=""
 SKIPPED=""
 FINISHED=0
 CHILD=""
+WATCHER=""
 CHECKS_OUT=""
 RESOLVER_OUT=""
+PRE_INDEX=""
 DH_BASE=""
 MERGE_COMMIT=""
 CONFLICT=0
@@ -102,31 +104,45 @@ kill_tree() { # kill_tree <pid>
 
 # Runs a command in its own process group with a time limit; signals interrupt the wait.
 # On timeout, completion or signal the whole group (grandchildren included) is killed.
+# The watcher PID is global so signal and exit handlers can reap it; the watcher only signals a
+# child group that is still alive, and the main flow escalates to SIGKILL (bounded) after the
+# group leader exits so TERM-ignoring grandchildren cannot survive.
 run_limited() { # run_limited <seconds> <command...>
-  local secs="$1" rc watcher
+  local secs="$1" rc child
   shift
   set -m
   "$@" &
-  CHILD=$!
+  child=$!
+  CHILD=$child
   (
     sleep "$secs"
+    kill -0 -- "-$child" 2>/dev/null || exit 0
     log WARN "timeout after ${secs}s: $1"
-    kill_tree "$CHILD"
+    kill -TERM -- "-$child" 2>/dev/null
     sleep 10
-    kill -KILL -- "-$CHILD" 2>/dev/null
+    kill -0 -- "-$child" 2>/dev/null && kill -KILL -- "-$child" 2>/dev/null
+    exit 0
   ) &
-  watcher=$!
+  WATCHER=$!
   set +m
-  wait "$CHILD"
+  wait "$child"
   rc=$?
-  kill_tree "$watcher"
-  kill_tree "$CHILD"
-  wait "$watcher" 2>/dev/null
+  kill_tree "$WATCHER"
+  wait "$WATCHER" 2>/dev/null
+  WATCHER=""
+  kill -TERM -- "-$child" 2>/dev/null
+  for _ in 1 2 3 4 5 6; do
+    kill -0 -- "-$child" 2>/dev/null || break
+    sleep 0.5
+  done
+  kill -0 -- "-$child" 2>/dev/null && kill -KILL -- "-$child" 2>/dev/null
   CHILD=""
   return "$rc"
 }
 
 cleanup() {
+  [ -n "$WATCHER" ] && kill_tree "$WATCHER"
+  [ -n "$PRE_INDEX" ] && rm -f "$PRE_INDEX"
   [ -n "$CHECKS_OUT" ] && rm -f "$CHECKS_OUT"
   [ -n "$RESOLVER_OUT" ] && rm -f "$RESOLVER_OUT"
   if [ "$WT_CREATED" = 1 ] && wt_registered "$WT"; then
@@ -157,6 +173,7 @@ on_exit() {
 }
 on_signal() { # on_signal <exit code>
   warn "received signal, stopping"
+  [ -n "$WATCHER" ] && kill_tree "$WATCHER"
   [ -n "$CHILD" ] && kill_tree "$CHILD"
   exit "$1"
 }
@@ -208,7 +225,14 @@ if ! git_repo rev-parse --git-dir >/dev/null 2>&1; then
 fi
 
 norm_url() { sed -e 's|/*$||' -e 's|\.git$||' <<<"$1"; }
-if [ "$(norm_url "$(git_repo remote get-url origin 2>/dev/null)")" = "$(norm_url "$(git_repo remote get-url upstream 2>/dev/null)")" ]; then
+for remote in origin upstream; do
+  if [ -z "$(git_repo remote get-url "$remote" 2>/dev/null)" ]; then
+    err "remote $remote is not configured"
+    notify_once "no-remote-$remote" "AO sync: remote $remote is not configured in $REPO"
+    finish precondition 30
+  fi
+done
+if [ "$(norm_url "$(git_repo remote get-url origin)")" = "$(norm_url "$(git_repo remote get-url upstream)")" ]; then
   err "origin and upstream URLs are identical; refusing to run"
   notify_once same-remotes "AO sync: origin and upstream point at the same URL; refusing to run"
   finish precondition 30
@@ -405,13 +429,20 @@ weakening_guard() {
   return "$rc"
 }
 
-# Files matching CONFIG_RE whose staged content equals neither parent (resolver-authored).
+# Index state before the resolver runs: "<mode> <blob> <stage>\t<path>" (conflicted paths have no stage 0).
+snapshot_index() { git -C "$WT" ls-files -s >"$PRE_INDEX"; }
+
+# Files matching CONFIG_RE that the RESOLVER changed: staged content differs from the pre-resolver
+# stage-0 entry (so cleanly auto-merged files are not flagged) and equals neither parent
+# (taking one side of a conflicted file as is stays allowed).
 config_changes() {
-  local f cur
+  local f cur pre
   { git -C "$WT" diff --cached --name-only "$DH_BASE"; git -C "$WT" diff --cached --name-only "$UPSTREAM_SHA"; } |
     sort -u | grep -E "$CONFIG_RE" | while IFS= read -r f; do
     cur="$(git -C "$WT" rev-parse -q --verify ":$f" 2>/dev/null)"
-    if [ "$cur" != "$(git -C "$WT" rev-parse -q --verify "$DH_BASE:$f" 2>/dev/null)" ] &&
+    pre="$(awk -F'\t' -v p="$f" '{ split($1, a, " "); if (a[3] == 0 && $2 == p) print a[2] }' "$PRE_INDEX")"
+    if [ "$cur" != "$pre" ] &&
+      [ "$cur" != "$(git -C "$WT" rev-parse -q --verify "$DH_BASE:$f" 2>/dev/null)" ] &&
       [ "$cur" != "$(git -C "$WT" rev-parse -q --verify "$UPSTREAM_SHA:$f" 2>/dev/null)" ]; then
       echo "$f"
     fi
@@ -472,6 +503,8 @@ else
   CONFLICT=1
 fi
 
+PRE_INDEX="$(mktemp "$LOG_DIR/.preindex.XXXXXX")"
+snapshot_index
 debug "escalating to resolver (program: ${RESOLVER_PROGRAM:-built-in claude})"
 run_limited "$RESOLVER_TIMEOUT" resolver_inner
 rrc=$?

@@ -64,7 +64,7 @@ new_fixture() {
   g clone -q "$T/upstream.git" "$T/work" 2>/dev/null
   printf 'l1\nl2\nl3\n' >"$T/work/a.txt"
   printf 'package x\nfunc TestX(t *testing.T) {\n\tassert.Equal(t, 1, 1)\n}\n' >"$T/work/x_test.go"
-  printf '{"scripts":{"test":"vitest"}}\n' >"$T/work/package.json"
+  printf '{\n"n1": 1,\n"n2": 2,\n"n3": 3,\n"n4": 4,\n"n5": 5,\n"n6": 6,\n"n7": 7\n}\n' >"$T/work/package.json"
   g -C "$T/work" add a.txt x_test.go package.json
   g -C "$T/work" commit -qm init
   g -C "$T/work" push -q origin HEAD:main
@@ -90,6 +90,7 @@ new_fixture() {
   stub checks_marker "touch '$T/checks.ran'"
   stub checks_move 'git commit --allow-empty -qm moved'
   stub leaky 'sleep 3141.59 & printf "merged\n" >a.txt'
+  stub leaky_term "( trap '' TERM; exec sleep 3141.59 ) & printf 'merged\n' >a.txt"
   stub leaky_slow 'sleep 3141.59 & wait'
   stub detach "git checkout -q --detach; rm BROKEN; git add -A; git commit -qm fix"
   : >"$T/notify.log"
@@ -363,6 +364,7 @@ done
 # (o) F7: SIGTERM releases lock and worktree; leftover worktree is cleaned; timeout
 new_fixture
 conflict_setup
+export AO_SYNC_RESOLVER_TIMEOUT=2718
 "$SYNC" --repo "$T/clone" --checks "$T/bin/checks" --resolver "$T/bin/slow" --notify "$T/bin/notify" \
   >"$T/out.log" 2>&1 </dev/null &
 spid=$!
@@ -378,6 +380,15 @@ check "o: exit 143" test "$rc" = 143
 check "o: lock released" test ! -e "$T/clone/.git/ao-sync.lock"
 check "o: worktree removed" test ! -e "$T/clone-sync"
 check "o: result=aborted" grep -q 'result=aborted' <<<"$(last_log)"
+unset AO_SYNC_RESOLVER_TIMEOUT
+# R1: the timeout watcher (a subshell sharing sync.sh's command line) and its sleep are gone too
+mine() { pgrep -f -- "--repo $T/clone" | wc -l | tr -d ' '; }
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(mine)" = 0 ] && [ "$(pgrep -f 'sleep 2718$' | wc -l | tr -d ' ')" = 0 ] && break
+  sleep 0.5
+done
+check "o: no leftover watcher after SIGTERM" test "$(mine)" = 0
+check "o: no leftover watcher sleep after SIGTERM" test "$(pgrep -f 'sleep 2718$' | wc -l | tr -d ' ')" = 0
 
 new_fixture
 upstream_commit b.txt b "upstream b"
@@ -529,6 +540,63 @@ mkdir "$T/clone/.git/ao-sync.lock"
 touch -t 202001010000 "$T/clone/.git/ao-sync.lock"
 rc="$(run_sync giveup)"
 check "x3: stale pid-less lock recovered" test "$rc" = 0
+
+# (y) R6: a grandchild ignoring TERM is escalated to KILL after the leader exits
+new_fixture
+conflict_setup
+rc="$(run_sync leaky_term)"
+check "y: run ok (exit 10)" test "$rc" = 10
+check "y: TERM-ignoring grandchild killed" settle
+
+# (z) R2: config files auto-merged cleanly are not flagged; only resolver-authored changes are
+new_fixture
+fork_commit dh/main package.json $'{\n"n1": 10,\n"n2": 2,\n"n3": 3,\n"n4": 4,\n"n5": 5,\n"n6": 6,\n"n7": 7\n}'
+upstream_commit package.json $'{\n"n1": 1,\n"n2": 2,\n"n3": 3,\n"n4": 4,\n"n5": 5,\n"n6": 6,\n"n7": 70\n}' "upstream pkg"
+conflict_setup
+rc="$(run_sync resolve)"
+check "z: auto-merged package.json not flagged (exit 10)" test "$rc" = 10
+check "z: sync branch pushed" test -n "$(sync_branches)"
+check "z: not needs-human" bash -c "! grep -q 'needs-human' '$T/logs/sync.log'"
+check "z: merged package.json has both edits" bash -c "g() { git -C '$T/fork.git' show \"\$1:package.json\"; }; b=\"$(sync_branches)\"; g \"\$b\" | grep -q 'n1\": 10' && g \"\$b\" | grep -q 'n7\": 70'"
+new_fixture
+fork_commit dh/main package.json $'{\n"n1": 10,\n"n2": 2,\n"n3": 3,\n"n4": 4,\n"n5": 5,\n"n6": 6,\n"n7": 7\n}'
+upstream_commit package.json $'{\n"n1": 1,\n"n2": 2,\n"n3": 3,\n"n4": 4,\n"n5": 5,\n"n6": 6,\n"n7": 70\n}' "upstream pkg"
+conflict_setup
+stub touch_pkg "printf 'merged\n' >a.txt; printf '{\"x\":1}\n' >package.json"
+rc="$(run_sync touch_pkg)"
+check "z2: resolver-authored package.json change flagged (exit 20)" test "$rc" = 20
+check "z2: result=needs-human" grep -q 'result=needs-human' <<<"$(last_log)"
+
+# (aa) R4: registered leftover worktree and plain directory under a path with spaces
+new_fixture
+upstream_commit b.txt b "upstream b"
+mkdir "$T/my space"
+mv "$T/clone" "$T/my space/clone"
+CL="$T/my space/clone"
+g -C "$CL" worktree add -q -b old/left "$CL-sync" origin/dh/main
+"$SYNC" --repo "$CL" --checks "$T/bin/checks" --resolver "$T/bin/giveup" --notify "$T/bin/notify" >"$T/out.log" 2>&1 </dev/null
+rc=$?
+check "aa: registered leftover with spaces recovered" test "$rc" = 0
+check "aa: landed" grep -q 'result=landed' <<<"$(last_log)"
+new_fixture
+upstream_commit b.txt b "upstream b"
+mkdir "$T/my space"
+mv "$T/clone" "$T/my space/clone"
+CL="$T/my space/clone"
+mkdir "$CL-sync"
+echo keep >"$CL-sync/file"
+"$SYNC" --repo "$CL" --checks "$T/bin/checks" --resolver "$T/bin/giveup" --notify "$T/bin/notify" >"$T/out.log" 2>&1 </dev/null
+rc=$?
+check "aa: plain dir with spaces refused (exit 30)" test "$rc" = 30
+check "aa: plain dir with spaces survives" test -e "$CL-sync/file"
+
+# (ab) R7: a missing remote is named, not reported as identical URLs
+new_fixture
+upstream_commit b.txt b "upstream b"
+g -C "$T/clone" remote remove upstream
+rc="$(run_sync giveup)"
+check "ab: missing remote exit 30" test "$rc" = 30
+check "ab: names the remote" grep -q 'remote upstream is not configured' "$T/logs/"2*.log
 
 echo "passed=$pass failed=$fail"
 test "$fail" = 0
