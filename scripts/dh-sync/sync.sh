@@ -12,7 +12,7 @@
 # Never pushes to upstream, never force-pushes, never touches the live checkout.
 #
 # Exit codes: 0 landed or nothing to do, 10 resolved and pushed to a sync branch awaiting
-#             land, 20 unresolved (dh/main untouched, notified), 30 precondition failure.
+#             land, 20 unresolved or needs a human (dh/main untouched, notified), 30 precondition failure.
 # Bash 3.2 compatible (macOS default).
 # shellcheck disable=SC2329 # functions are invoked indirectly (traps, run_limited)
 set -u
@@ -65,16 +65,25 @@ BRANCH=-
 LOCK=""
 OWN_LOCK=0
 WT=""
+WT_CREATED=0
 NOTIFY_STATUS=""
 SKIPPED=""
 FINISHED=0
 CHILD=""
 CHECKS_OUT=""
+RESOLVER_OUT=""
 DH_BASE=""
 MERGE_COMMIT=""
 CONFLICT=0
 
 git_repo() { git -C "$REPO" "$@"; }
+
+# True only if git registers exactly this path as a worktree of this repo.
+wt_registered() { # wt_registered <path>
+  local real
+  real="$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)/$(basename "$1")"
+  git_repo worktree list --porcelain 2>/dev/null | grep -Fxq "worktree $real"
+}
 
 # Pushes from the worktree. Refspec must be explicit, never forced. Remote is always origin.
 push_wt() { # push_wt <refspec>
@@ -84,16 +93,19 @@ push_wt() { # push_wt <refspec>
   git -C "$WT" push origin "$1"
 }
 
+# Timed jobs run under set -m, so each is its own process group; kill the whole group.
 kill_tree() { # kill_tree <pid>
-  pkill -TERM -P "$1" 2>/dev/null
+  kill -TERM -- "-$1" 2>/dev/null
   kill -TERM "$1" 2>/dev/null
   return 0
 }
 
-# Runs a command in the background with a time limit; signals interrupt the wait.
+# Runs a command in its own process group with a time limit; signals interrupt the wait.
+# On timeout, completion or signal the whole group (grandchildren included) is killed.
 run_limited() { # run_limited <seconds> <command...>
   local secs="$1" rc watcher
   shift
+  set -m
   "$@" &
   CHILD=$!
   (
@@ -101,13 +113,14 @@ run_limited() { # run_limited <seconds> <command...>
     log WARN "timeout after ${secs}s: $1"
     kill_tree "$CHILD"
     sleep 10
-    kill -KILL "$CHILD" 2>/dev/null
+    kill -KILL -- "-$CHILD" 2>/dev/null
   ) &
   watcher=$!
+  set +m
   wait "$CHILD"
   rc=$?
-  kill "$watcher" 2>/dev/null
-  pkill -P "$watcher" 2>/dev/null
+  kill_tree "$watcher"
+  kill_tree "$CHILD"
   wait "$watcher" 2>/dev/null
   CHILD=""
   return "$rc"
@@ -115,11 +128,12 @@ run_limited() { # run_limited <seconds> <command...>
 
 cleanup() {
   [ -n "$CHECKS_OUT" ] && rm -f "$CHECKS_OUT"
-  if [ -n "$WT" ] && [ -e "$WT" ]; then
+  [ -n "$RESOLVER_OUT" ] && rm -f "$RESOLVER_OUT"
+  if [ "$WT_CREATED" = 1 ] && wt_registered "$WT"; then
     git_repo worktree remove --force "$WT" >/dev/null 2>&1 || rm -rf "$WT"
     git_repo worktree prune
   fi
-  if [ "$BRANCH" != "-" ] && [ -n "$WT" ]; then
+  if [ "$WT_CREATED" = 1 ] && [ "$BRANCH" != "-" ]; then
     git_repo branch -D "$BRANCH" >/dev/null 2>&1
   fi
   if [ "$OWN_LOCK" = 1 ]; then
@@ -190,6 +204,13 @@ prune_logs
 if ! git_repo rev-parse --git-dir >/dev/null 2>&1; then
   err "not a git repo: $REPO"
   notify_once not-a-repo "AO sync: $REPO is not a git repository"
+  finish precondition 30
+fi
+
+norm_url() { sed -e 's|/*$||' -e 's|\.git$||' <<<"$1"; }
+if [ "$(norm_url "$(git_repo remote get-url origin 2>/dev/null)")" = "$(norm_url "$(git_repo remote get-url upstream 2>/dev/null)")" ]; then
+  err "origin and upstream URLs are identical; refusing to run"
+  notify_once same-remotes "AO sync: origin and upstream point at the same URL; refusing to run"
   finish precondition 30
 fi
 
@@ -271,13 +292,19 @@ fi
 WT="$(dirname "$REPO")/$(basename "$REPO")-sync"
 git_repo worktree prune
 if [ -e "$WT" ]; then
-  warn "removing leftover sync worktree $WT"
-  git_repo worktree remove --force "$WT" >/dev/null 2>&1 || rm -rf "$WT"
-  git_repo worktree prune
+  if wt_registered "$WT"; then
+    warn "removing leftover sync worktree $WT"
+    git_repo worktree remove --force "$WT" >/dev/null 2>&1 || precondition "could not remove leftover worktree $WT"
+    git_repo worktree prune
+  else
+    precondition "$WT exists but is not a worktree of this repo; refusing to remove it"
+  fi
 fi
 git_repo worktree add --quiet -b "$BRANCH" "$WT" "$DH_BASE" || precondition "could not create worktree $WT"
+WT_CREATED=1
 
 CHECKS_OUT="$(mktemp "$LOG_DIR/.checks.XXXXXX")"
+RESOLVER_OUT="$(mktemp "$LOG_DIR/.resolver.XXXXXX")"
 export AO_SYNC_UPSTREAM_SHA="$UPSTREAM_SHA"
 export AO_SYNC_BRANCH="$BRANCH"
 export AO_SYNC_TICKET="$TICKET"
@@ -306,58 +333,89 @@ render_prompt() {
   printf '%s\n' "$tpl"
 }
 
-# Edit-only Claude session: no git, no network, no MCP, project settings (upstream-controlled) ignored.
-# Edits outside the worktree are not auto-approved by acceptEdits and are denied in -p mode.
+# Edit-only Claude session: file tools only (no Bash, no git, no network, no MCP), project settings
+# (upstream-controlled) ignored. Edits outside the worktree are not auto-approved by acceptEdits and
+# are denied in -p mode. No --max-turns: it is not documented in claude --help; runtime is bounded
+# by run_limited instead. Output is kept so a rejected-arguments failure is recognised.
 claude_resolver() {
   cd "$WT" || return 1
-  render_prompt | claude -p --max-turns 60 --permission-mode acceptEdits \
+  render_prompt | claude -p --permission-mode acceptEdits \
     --setting-sources local --strict-mcp-config \
-    --tools "Read,Edit,Write,Grep,Glob,Bash" \
-    --allowedTools "Read,Edit,Write,Grep,Glob,Bash(git diff:*),Bash(git status:*)" \
-    --disallowedTools "WebFetch,WebSearch,Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git checkout:*),Bash(git switch:*),Bash(git reset:*),Bash(git merge:*),Bash(git remote:*)"
+    --tools "Read,Edit,Write,Grep,Glob" \
+    --allowedTools "Read,Edit,Write,Grep,Glob" \
+    --disallowedTools "WebFetch,WebSearch,Bash"
 }
 resolver_inner() {
   if [ -n "$RESOLVER_PROGRAM" ]; then
-    (cd "$WT" && "$RESOLVER_PROGRAM")
+    (cd "$WT" && "$RESOLVER_PROGRAM") >"$RESOLVER_OUT" 2>&1
   else
-    claude_resolver
+    claude_resolver >"$RESOLVER_OUT" 2>&1
   fi
 }
 
-# --- Test-weakening guard (heuristic, documented in README) -------------------------------
-# Compares the staged result against BOTH parents. Only changes the resolver authored count:
-# something deleted/added/removed relative to both parents (a one-sided upstream or fork
-# change is legitimate). Flags: (1) a test file present in both parents but deleted,
-# (2) added skip/only markers in test files, (3) removed assertion lines in test files.
-TEST_RE='(_test\.go|\.test\.(ts|tsx|js|jsx|mjs)|\.spec\.(ts|tsx|js|jsx))$'
-SKIP_RE='(t\.Skip(Now|f)?\(|\.skip\(|(^|[^A-Za-z])x(it|describe|test)\(|\.only\()'
-ASSERT_RE='(expect\(|assert[A-Za-z_.]*\(|require\.[A-Za-z]+\(|t\.(Error|Errorf|Fatal|Fatalf)\()'
+# --- Test-weakening guard (heuristic) --------------------------------------------------------
+# Compares the staged result with BOTH parents and the merge base, so one-sided upstream or
+# fork changes are legitimate and only resolver-authored changes count. Flags:
+#  1. a test file present in both parents that is deleted or renamed away,
+#  2. skip/only/todo markers added (in neither parent),
+#  3. a removed assertion or test-definition line that the other side did not itself remove:
+#     lines removed vs dh/main unless upstream removed them, and the reverse.
+# Not covered (accepted residual): conditions such as "if got != want {", early returns,
+# vitest/jest exclude lists beyond CONFIG_RE, __tests__ naming, paths with spaces.
+TEST_RE='(_test\.go|\.test\.(ts|tsx|js|jsx|mjs|mts|cts)|\.spec\.(ts|tsx|js|jsx|mjs|mts))$'
+SKIP_RE='(t\.Skip(Now|f)?\(|\.skip\(|\.skipIf\(|\.todo\(|\.fixme\(|(^|[^A-Za-z])x(it|describe|test)\(|\.only\(|go:build ignore|\+build ignore)'
+REMOVED_RE='(expect\(|assert[A-Za-z_.]*\(|require\.[A-Za-z]+\(|t\.(Error|Errorf|Fatal|Fatalf|Run)\(|func Test[A-Za-z0-9_]*\(|(^|[^A-Za-z])(it|test|describe)(\.each)?\()'
+# Build/test configuration whose resolver-authored change must never auto-land: it runs code when
+# checks run (npm scripts, .npmrc, go.work, Makefile/Taskfile) or changes what tests run.
+CONFIG_RE='(^|/)(package\.json|\.npmrc|go\.work|Makefile|Taskfile\.ya?ml|vitest\.[a-z.]*config\.[a-z]+|vite\.[a-z.]*config\.[a-z]+|playwright\.config\.[a-z]+|\.golangci\.ya?ml|\.github/workflows/[^/]+)$'
 
-deleted_tests() { git -C "$WT" diff --cached --diff-filter=D --name-only "$1" | grep -E "$TEST_RE" | sort -u; }
+# Test files removed or renamed away relative to a parent (old paths).
+gone_tests() { # gone_tests <parent>
+  git -C "$WT" diff --cached --find-renames --name-status "$1" |
+    awk -F'\t' '$1 ~ /^[DR]/ { print $2 }' | grep -E "$TEST_RE" | sort -u
+}
 
-# test_lines <parent> <+|-> : "path<TAB>line" for added/removed lines in test files (paths without spaces).
-test_lines() {
-  git -C "$WT" diff --cached -U0 "$1" | awk -v sign="$2" -v re="$TEST_RE" '
+# tl <+|-> <git diff args...>: "path<TAB>line" for added/removed lines in test files (no renames).
+tl() {
+  local sign="$1"
+  shift
+  git -C "$WT" diff -U0 --no-renames "$@" | awk -v sign="$sign" -v re="$TEST_RE" '
     /^diff --git / { f = $4; sub(/^b\//, "", f); next }
     /^(\+\+\+|---) / { next }
     substr($0, 1, 1) == sign && f ~ re { print f "\t" substr($0, 2) }'
 }
 
-both_parents() { # both_parents <sign> <line regex>: lines changed relative to both parents
-  comm -12 \
-    <(test_lines "$DH_BASE" "$1" | grep -E "$2" | sort -u) \
-    <(test_lines "$UPSTREAM_SHA" "$1" | grep -E "$2" | sort -u)
+weakening_guard() {
+  local out rc=0 mb
+  mb="$(git -C "$WT" merge-base "$DH_BASE" "$UPSTREAM_SHA")"
+  out="$(comm -12 <(gone_tests "$DH_BASE") <(gone_tests "$UPSTREAM_SHA"))"
+  [ -n "$out" ] && { err "guard: resolver deleted or renamed test files: $out"; rc=1; }
+  out="$(comm -12 \
+    <(tl + --cached "$DH_BASE" | grep -E "$SKIP_RE" | sort -u) \
+    <(tl + --cached "$UPSTREAM_SHA" | grep -E "$SKIP_RE" | sort -u))"
+  [ -n "$out" ] && { err "guard: resolver added skip markers: $out"; rc=1; }
+  out="$(comm -23 \
+    <(tl - --cached "$DH_BASE" | grep -E "$REMOVED_RE" | sort -u) \
+    <(tl - "$mb" "$UPSTREAM_SHA" | grep -E "$REMOVED_RE" | sort -u))"
+  [ -n "$out" ] && { err "guard: resolver dropped fork-side assertions/tests: $out"; rc=1; }
+  out="$(comm -23 \
+    <(tl - --cached "$UPSTREAM_SHA" | grep -E "$REMOVED_RE" | sort -u) \
+    <(tl - "$mb" "$DH_BASE" | grep -E "$REMOVED_RE" | sort -u))"
+  [ -n "$out" ] && { err "guard: resolver dropped upstream-side assertions/tests: $out"; rc=1; }
+  return "$rc"
 }
 
-weakening_guard() {
-  local out rc=0
-  out="$(comm -12 <(deleted_tests "$DH_BASE") <(deleted_tests "$UPSTREAM_SHA"))"
-  [ -n "$out" ] && { err "guard: resolver deleted test files: $out"; rc=1; }
-  out="$(both_parents + "$SKIP_RE")"
-  [ -n "$out" ] && { err "guard: resolver added skip markers: $out"; rc=1; }
-  out="$(both_parents - "$ASSERT_RE")"
-  [ -n "$out" ] && { err "guard: resolver removed assertions: $out"; rc=1; }
-  return "$rc"
+# Files matching CONFIG_RE whose staged content equals neither parent (resolver-authored).
+config_changes() {
+  local f cur
+  { git -C "$WT" diff --cached --name-only "$DH_BASE"; git -C "$WT" diff --cached --name-only "$UPSTREAM_SHA"; } |
+    sort -u | grep -E "$CONFIG_RE" | while IFS= read -r f; do
+    cur="$(git -C "$WT" rev-parse -q --verify ":$f" 2>/dev/null)"
+    if [ "$cur" != "$(git -C "$WT" rev-parse -q --verify "$DH_BASE:$f" 2>/dev/null)" ] &&
+      [ "$cur" != "$(git -C "$WT" rev-parse -q --verify "$UPSTREAM_SHA:$f" 2>/dev/null)" ]; then
+      echo "$f"
+    fi
+  done
 }
 
 save_summary() {
@@ -390,9 +448,15 @@ unresolved() { # unresolved <reason>
 
 land_dh() {
   attached || precondition "worktree HEAD is not on $BRANCH; refusing to push dh/main"
+  # The checks run upstream code in this worktree: make sure nothing moved HEAD.
+  [ "$(git -C "$WT" rev-parse HEAD)" = "$MERGE_COMMIT" ] ||
+    precondition "worktree HEAD moved during the checks; refusing to push dh/main"
   push_wt "HEAD:refs/heads/dh/main" || precondition "push of dh/main was rejected"
   [ "$(git -C "$WT" ls-remote origin refs/heads/dh/main | cut -f1)" = "$(git -C "$WT" rev-parse HEAD)" ] ||
     precondition "origin/dh/main does not match the pushed commit"
+  if [ -n "$SKIPPED" ]; then
+    notify_once checks-skipped "AO sync: upstream $SHORT landed on dh/main with checks skipped: $SKIPPED"
+  fi
   finish landed 0
 }
 
@@ -410,7 +474,28 @@ fi
 
 debug "escalating to resolver (program: ${RESOLVER_PROGRAM:-built-in claude})"
 run_limited "$RESOLVER_TIMEOUT" resolver_inner
-log INFO "resolver exited with $?"
+rrc=$?
+log INFO "resolver exited with $rrc"
+cat "$RESOLVER_OUT"
+if [ -z "$RESOLVER_PROGRAM" ] && [ "$rrc" != 0 ] &&
+  grep -qiE 'unknown option|unrecognized (option|argument)|invalid (option|argument)|^usage:|error: (unknown|too many|required)' "$RESOLVER_OUT"; then
+  err "claude rejected its arguments"
+  unresolved "claude rejected its arguments; the resolver never ran (check the claude CLI version)"
+fi
+
+commit_resolved() {
+  if [ "$CONFLICT" = 1 ]; then
+    git -C "$WT" commit -q -m "🔀 merge: sync upstream $SHORT" \
+      -m "Conflicts resolved by an automated Claude Code session; verified by sync.sh." -m "Refs: $TICKET"
+  else
+    git -C "$WT" commit -q -m "🐛 fix(sync): adapt fork to upstream $SHORT" \
+      -m "Applied by an automated Claude Code session; verified by sync.sh." -m "Refs: $TICKET"
+  fi
+  attached || precondition "worktree HEAD is not on $BRANCH after commit"
+  push_wt "HEAD:refs/heads/$BRANCH" || precondition "push of $BRANCH was rejected"
+  [ "$(git -C "$WT" ls-remote origin "refs/heads/$BRANCH" | cut -f1)" = "$(git -C "$WT" rev-parse HEAD)" ] ||
+    precondition "origin/$BRANCH does not match the pushed commit"
+}
 
 # Never trust the resolver's claim: verify the result ourselves.
 attached || unresolved "HEAD detached or switched away from $BRANCH"
@@ -428,18 +513,16 @@ weakening_guard || unresolved "test-weakening guard tripped"
 if [ "$CONFLICT" = 0 ] && git -C "$WT" diff --cached --quiet; then
   unresolved "resolver made no changes"
 fi
+# Resolver-authored build/test config is never run or auto-landed: checks would execute it.
+cfg="$(config_changes | tr '\n' ' ')"
+if [ -n "$cfg" ]; then
+  warn "resolver changed build/test config: $cfg"
+  commit_resolved
+  notify "AO sync NEEDS HUMAN: resolver changed build/test config ($cfg). Checks were NOT run. Pushed origin/$BRANCH for review; dh/main untouched."
+  finish needs-human 20
+fi
 run_checks || unresolved "checks red after resolver"
 
-if [ "$CONFLICT" = 1 ]; then
-  git -C "$WT" commit -q -m "🔀 merge: sync upstream $SHORT" \
-    -m "Conflicts resolved by an automated Claude Code session; verified by sync.sh." -m "Refs: $TICKET"
-else
-  git -C "$WT" commit -q -m "🐛 fix(sync): adapt fork to upstream $SHORT" \
-    -m "Applied by an automated Claude Code session; verified by sync.sh." -m "Refs: $TICKET"
-fi
-attached || precondition "worktree HEAD is not on $BRANCH after commit"
-push_wt "HEAD:refs/heads/$BRANCH" || precondition "push of $BRANCH was rejected"
-[ "$(git -C "$WT" ls-remote origin "refs/heads/$BRANCH" | cut -f1)" = "$(git -C "$WT" rev-parse HEAD)" ] ||
-  precondition "origin/$BRANCH does not match the pushed commit"
+commit_resolved
 notify "AO sync: upstream $SHORT merged on origin/$BRANCH (checks green${SKIPPED:+, skipped: $SKIPPED}). dh/main NOT updated: land the branch. Summary: $LOG_DIR/$STAMP-SUMMARY.md"
 finish resolved 10

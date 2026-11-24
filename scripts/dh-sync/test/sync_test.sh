@@ -20,6 +20,7 @@ mkdir "$FAKEBIN"
 cat >"$FAKEBIN/osascript" <<'EOF'
 #!/bin/bash
 echo "osascript $*" >>"${FAKE_OSA_REC:-/dev/null}"
+[ -z "${FAKE_OSA_FAIL:-}" ]
 EOF
 cat >"$FAKEBIN/claude" <<'EOF'
 #!/bin/bash
@@ -30,6 +31,10 @@ cat >"$FAKEBIN/claude" <<'EOF'
   echo "stdin<<"
   [ -t 0 ] || cat
 } >>"${FAKE_CLAUDE_REC:-/dev/null}"
+if [ -n "${FAKE_CLAUDE_REJECT:-}" ]; then
+  printf "error: unknown option '--x'\nUsage: claude [options]\n" >&2
+  exit 2
+fi
 [ -n "${FAKE_CLAUDE_OUT:-}" ] && printf '%s\n' "$FAKE_CLAUDE_OUT"
 exit 0
 EOF
@@ -59,7 +64,8 @@ new_fixture() {
   g clone -q "$T/upstream.git" "$T/work" 2>/dev/null
   printf 'l1\nl2\nl3\n' >"$T/work/a.txt"
   printf 'package x\nfunc TestX(t *testing.T) {\n\tassert.Equal(t, 1, 1)\n}\n' >"$T/work/x_test.go"
-  g -C "$T/work" add a.txt x_test.go
+  printf '{"scripts":{"test":"vitest"}}\n' >"$T/work/package.json"
+  g -C "$T/work" add a.txt x_test.go package.json
   g -C "$T/work" commit -qm init
   g -C "$T/work" push -q origin HEAD:main
   g -C "$T/work" push -q "$T/fork.git" HEAD:main HEAD:refs/heads/dh/main
@@ -78,6 +84,13 @@ new_fixture() {
   stub del_test "printf 'merged\n' >a.txt; rm x_test.go"
   stub skip_test "printf 'merged\n' >a.txt; printf '\tt.Skip(\"x\")\n' >>x_test.go"
   stub drop_assert "printf 'merged\n' >a.txt; grep -v assert x_test.go >x.tmp; mv x.tmp x_test.go"
+  stub rename_test "printf 'merged\n' >a.txt; mv x_test.go x_test.go.off"
+  stub drop_fork 'printf "package x\nfunc TestX(t *testing.T) {\n\tassert.Equal(t, 1, 1)\n\tassert.Equal(t, 3, 3)\n}\n" >x_test.go'
+  stub cfg_change 'printf "{\"scripts\":{\"test\":\"true\"}}\n" >package.json'
+  stub checks_marker "touch '$T/checks.ran'"
+  stub checks_move 'git commit --allow-empty -qm moved'
+  stub leaky 'sleep 3141.59 & printf "merged\n" >a.txt'
+  stub leaky_slow 'sleep 3141.59 & wait'
   stub detach "git checkout -q --detach; rm BROKEN; git add -A; git commit -qm fix"
   : >"$T/notify.log"
   export AO_SYNC_LOG_DIR="$T/logs"
@@ -289,7 +302,9 @@ check "k: tools restricted" grep -qx 'arg=--tools' "$rec"
 check "k: strict mcp" grep -qx 'arg=--strict-mcp-config' "$rec"
 check "k: project settings ignored" grep -qx 'arg=local' "$rec"
 check "k: no web tools allowed" bash -c "! grep '^arg=Read' '$rec' | grep -qE 'Web'"
-check "k: git commit/push denied" bash -c "grep -q 'Bash(git commit:\*)' '$rec' && grep -q 'Bash(git push:\*)' '$rec'"
+check "k: Bash not in tools" bash -c "! awk '/^arg=--tools\$/{getline; print}' '$rec' | grep -q Bash"
+check "k: Bash and web denied" grep -qx 'arg=WebFetch,WebSearch,Bash' "$rec"
+check "k: no max-turns" bash -c "! grep -q 'max-turns' '$rec'"
 check "k: no bypass flags" bash -c "! grep -qiE 'dangerously|bypass|skip-permissions' '$rec'"
 check "k: prompt has real sha" grep -q "$(upstream_main)" "$rec"
 check "k: prompt has branch" grep -q 'sync/upstream-' "$rec"
@@ -308,6 +323,20 @@ out="$("$DHSYNC/notify.sh" "second" 2>&1 </dev/null)"
 unset FAKE_CLAUDE_OUT
 check "l: sent only when confirmed" test "$(tail -n 1 <<<"$out")" = "notify=sent"
 check "l: slack tool allow-listed" grep -q 'arg=mcp__' "$T/claude.log"
+check "l: slack session uses user settings only" grep -qx 'arg=user' "$T/claude.log"
+check "l: no max-turns in notify" bash -c "! grep -q 'max-turns' '$T/claude.log'"
+export FAKE_CLAUDE_REJECT=1
+out="$("$DHSYNC/notify.sh" "third" 2>&1 </dev/null)"
+unset FAKE_CLAUDE_REJECT
+check "l: rejected args: local-only" test "$(tail -n 1 <<<"$out")" = "notify=local-only"
+check "l: rejected args recorded" grep -q 'claude rejected its arguments' "$T/logs/status.log"
+export FAKE_OSA_FAIL=1
+out="$("$DHSYNC/notify.sh" "fourth" 2>&1 </dev/null)"
+check "l: osascript failure reflected" test "$(tail -n 1 <<<"$out")" = "notify=osascript-failed"
+export FAKE_CLAUDE_OUT=SLACK_SENT
+out="$("$DHSYNC/notify.sh" "fifth" 2>&1 </dev/null)"
+unset FAKE_CLAUDE_OUT FAKE_OSA_FAIL
+check "l: sent without banner" test "$(tail -n 1 <<<"$out")" = "notify=sent-no-banner"
 
 # (m) F4: resolver detaches HEAD and commits: fails safely and notifies
 new_fixture
@@ -320,7 +349,7 @@ check "m: notified" test "$(notify_count)" = 1
 check "m: detached commit not pushed" test -z "$(g -C "$T/fork.git" log --all --oneline --grep=fix)"
 
 # (n) F6: test-weakening guard
-for variant in del_test skip_test drop_assert; do
+for variant in del_test skip_test drop_assert rename_test; do
   new_fixture
   conflict_setup
   before="$(fork_ref dh/main)"
@@ -371,6 +400,7 @@ upstream_commit b.txt b "upstream b"
 rc="$(run_sync giveup checks_skip)"
 check "p: exit 0" test "$rc" = 0
 check "p: skip recorded" grep -q 'skipped=golangci-lint' <<<"$(last_log)"
+check "p: skip on landing is notified" grep -q 'skipped: golangci-lint' "$T/notify.log"
 
 # (p2) checks.sh itself reports skips, with fake toolchain and no golangci-lint
 new_fixture
@@ -402,6 +432,103 @@ rc="$(run_sync summary)"
 check "r: exit 10" test "$rc" = 10
 check "r: summary kept" grep -q 'summary text' "$T/logs/"*-SUMMARY.md
 check "r: summary not committed" test -z "$(g -C "$T/fork.git" ls-tree "$(sync_branches)" -- SYNC_SUMMARY.md)"
+
+# (s) N1: rejected claude arguments are detected and reported (resolver)
+new_fixture
+conflict_setup
+export FAKE_CLAUDE_REJECT=1
+"$SYNC" --repo "$T/clone" --checks "$T/bin/checks" --notify "$T/bin/notify" >"$T/out.log" 2>&1 </dev/null
+rc=$?
+unset FAKE_CLAUDE_REJECT
+check "s: exit 20" test "$rc" = 20
+check "s: notify says claude rejected its arguments" grep -q 'rejected its arguments' "$T/notify.log"
+
+# (t) N2: fork-side assertion dropped in a conflicted test file; resolver-authored config change
+new_fixture
+fork_commit dh/main x_test.go $'package x\nfunc TestX(t *testing.T) {\n\tassert.Equal(t, 1, 1)\n\tassert.Equal(t, 2, 2)\n}'
+upstream_commit x_test.go $'package x\nfunc TestX(t *testing.T) {\n\tassert.Equal(t, 1, 1)\n\tassert.Equal(t, 3, 3)\n}' "upstream x_test"
+before="$(fork_ref dh/main)"
+rc="$(run_sync drop_fork)"
+check "t: dropped fork-side assertion -> exit 20" test "$rc" = 20
+check "t: dh/main unchanged" test "$(fork_ref dh/main)" = "$before"
+check "t: nothing pushed" test -z "$(sync_branches)"
+check "t: guard names fork-side" grep -q 'fork-side' "$T/logs/"2*.log
+
+new_fixture
+fork_commit dh/main package.json '{"scripts":{"test":"a"}}'
+upstream_commit package.json '{"scripts":{"test":"b"}}' "upstream pkg"
+before="$(fork_ref dh/main)"
+rc="$(run_sync cfg_change checks_marker)"
+check "t2: config change -> exit 20" test "$rc" = 20
+check "t2: checks were not run" test ! -e "$T/checks.ran"
+check "t2: dh/main unchanged" test "$(fork_ref dh/main)" = "$before"
+check "t2: sync branch pushed for review" test -n "$(sync_branches)"
+check "t2: notified needs human" grep -q 'NEEDS HUMAN' "$T/notify.log"
+check "t2: result=needs-human" grep -q 'result=needs-human' <<<"$(last_log)"
+
+# (u) N3: a plain directory at <repo>-sync is never removed
+new_fixture
+upstream_commit b.txt b "upstream b"
+mkdir "$T/clone-sync"
+echo keep >"$T/clone-sync/file"
+rc="$(run_sync giveup)"
+check "u: exit 30" test "$rc" = 30
+check "u: directory survives" test -e "$T/clone-sync/file"
+check "u: notified" test "$(notify_count)" = 1
+
+# (v) N8: HEAD moved by the checks -> refuse to land; identical remote URLs -> refuse to run
+new_fixture
+upstream_commit b.txt b "upstream b"
+before="$(fork_ref dh/main)"
+rc="$(run_sync giveup checks_move)"
+check "v: exit 30" test "$rc" = 30
+check "v: dh/main unchanged" test "$(fork_ref dh/main)" = "$before"
+
+new_fixture
+upstream_commit b.txt b "upstream b"
+g -C "$T/clone" remote set-url upstream "$T/fork.git"
+before="$(fork_ref main)$(fork_ref dh/main)"
+rc="$(run_sync giveup)"
+check "v2: same URLs exit 30" test "$rc" = 30
+check "v2: nothing changed" test "$(fork_ref main)$(fork_ref dh/main)" = "$before"
+
+# (w) N4: no leaked processes (unique sleep durations; pre-existing sleeps are never touched)
+procs() { pgrep -f -c 'sleep (3141\.59|2718|3141)$' 2>/dev/null || pgrep -f 'sleep (3141\.59|2718|3141)$' | wc -l | tr -d ' '; }
+settle() { for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(procs)" = 0 ] && return 0; sleep 0.5; done; return 1; }
+new_fixture
+conflict_setup
+export AO_SYNC_RESOLVER_TIMEOUT=2718 AO_SYNC_CHECKS_TIMEOUT=3141
+rc="$(run_sync leaky)"
+check "w: leaky resolver run ok (exit 10)" test "$rc" = 10
+check "w: no leftover processes after normal run" settle
+new_fixture
+conflict_setup
+export AO_SYNC_RESOLVER_TIMEOUT=1
+rc="$(run_sync leaky_slow)"
+unset AO_SYNC_RESOLVER_TIMEOUT AO_SYNC_CHECKS_TIMEOUT
+check "w: timeout run exit 20" test "$rc" = 20
+check "w: no leftover processes after timeout" settle
+
+# (x) notify_once suppression for dh/main missing; dry-run; stale pid-less lock
+new_fixture
+g -C "$T/fork.git" update-ref -d refs/heads/dh/main
+rc="$(run_sync giveup)"
+rc="$(run_sync giveup)"
+check "x: dh/main-missing notified once per day" test "$(notify_count)" = 1
+
+new_fixture
+upstream_commit b.txt b "upstream b"
+before="$(fork_ref main)"
+"$SYNC" --repo "$T/clone" --dry-run --notify "$T/bin/notify" >"$T/out.log" 2>&1 </dev/null
+check "x2: dry-run pushes nothing" test "$(fork_ref main)" = "$before"
+check "x2: dry-run result noop" grep -q 'result=noop' <<<"$(last_log)"
+
+new_fixture
+upstream_commit b.txt b "upstream b"
+mkdir "$T/clone/.git/ao-sync.lock"
+touch -t 202001010000 "$T/clone/.git/ao-sync.lock"
+rc="$(run_sync giveup)"
+check "x3: stale pid-less lock recovered" test "$rc" = 0
 
 echo "passed=$pass failed=$fail"
 test "$fail" = 0
