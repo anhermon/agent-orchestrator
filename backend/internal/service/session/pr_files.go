@@ -408,11 +408,9 @@ func ensurePRRevisionObjects(ctx context.Context, root, remote string, pr domain
 		refspecs = append(refspecs, "+refs/heads/"+pr.TargetBranch+":"+refPrefix+"/base")
 	}
 	if !headExists {
-		providerRef := "refs/pull/" + strconv.Itoa(pr.Number) + "/head"
-		if strings.EqualFold(pr.Provider, "gitlab") {
-			providerRef = "refs/merge-requests/" + strconv.Itoa(pr.Number) + "/head"
+		if refspec := prHeadRefspec(pr, refPrefix); refspec != "" {
+			refspecs = append(refspecs, refspec)
 		}
-		refspecs = append(refspecs, "+"+providerRef+":"+refPrefix+"/head")
 	}
 	if strings.TrimSpace(remote) != "" && len(refspecs) > 0 {
 		fetchCtx, cancel := context.WithTimeout(ctx, workspaceReviewTimeout)
@@ -423,6 +421,23 @@ func ensurePRRevisionObjects(ctx context.Context, root, remote string, pr domain
 		return unavailablePRSource()
 	}
 	return nil
+}
+
+// prHeadRefspec returns the refspec that fetches a PR's head, or "" when the
+// provider exposes none. Bitbucket Cloud has no refs/pull/N/head, so its
+// source branch is fetched instead (PRs from forks stay unavailable).
+func prHeadRefspec(pr domain.PullRequest, refPrefix string) string {
+	number := strconv.Itoa(pr.Number)
+	switch {
+	case strings.EqualFold(pr.Provider, "gitlab"):
+		return "+refs/merge-requests/" + number + "/head:" + refPrefix + "/head"
+	case strings.EqualFold(pr.Provider, "bitbucket"):
+		if strings.TrimSpace(pr.SourceBranch) == "" {
+			return ""
+		}
+		return "+refs/heads/" + pr.SourceBranch + ":" + refPrefix + "/head"
+	}
+	return "+refs/pull/" + number + "/head:" + refPrefix + "/head"
 }
 
 func unavailablePRSource() error {

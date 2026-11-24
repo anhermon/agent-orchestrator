@@ -28,6 +28,11 @@ TBD: location of the job that fast-forwards `main` from upstream and merges it i
 | backend/internal/service/review/review.go | providerFromPRURL | /pull-requests/ URLs resolve to provider "bitbucket" | 5 |
 | backend/internal/adapters/workspace/gitworktree/workspace_integration_test.go | TestWorkspaceIntegrationRemotelessRepoWithConfiguredBranchCreatesWorktree | Test only: remoteless repo with a configured default branch creates and destroys a worktree; no production change needed | 6 |
 | backend/internal/observe/scm/observer_test.go | TestPoll_RemotelessProjectIsSilentlySkipped | Test only: remoteless project causes no provider calls and no Info+ logs; no production change needed | 6 |
+| backend/internal/service/session/pr_files.go | ensurePRRevisionObjects, prHeadRefspec | Bitbucket has no refs/pull/N/head; fetch the PR source branch instead | 5 |
 
 ### Known GitHub-only (left untouched)
-reviewgateway/gateway.go, cli/pr_ref.go, cli/triage_*, githubpat, importer, telemetry, copilot reviewer, trackerintake (beyond the empty-provider guard), cli/spawn.go --tracker-provider, lifecycle/review_done.go (review anchor is a GitHub-only feature; Bitbucket gets the "Review ID" fallback), service/session/pr_summary.go (the "github" default stays; the Bitbucket observer sets Provider).
+reviewgateway/gateway.go, cli/pr_ref.go, cli/triage_*, githubpat, importer, telemetry, copilot reviewer, trackerintake (beyond the empty-provider guard), cli/spawn.go --tracker-provider, service/session/claim_pr.go sameRenamedGitHubRepo (GitHub rename lookup only), lifecycle/review_done.go (deliberately skipped although spec 3b lists it: the review anchor is a GitHub-only feature; Bitbucket gets the "Review ID" fallback), service/session/pr_summary.go (the "github" default stays; the Bitbucket observer sets Provider).
+
+
+### Known limitations
+- Bitbucket PR diffs from a fork source repository stay unavailable locally (the source branch is fetched from origin only), as does a PR whose source branch was already deleted.

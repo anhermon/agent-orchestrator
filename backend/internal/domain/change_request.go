@@ -37,7 +37,8 @@ type RepositoryRename struct {
 // bitbucketPRViews are the tab suffixes Bitbucket appends to a PR web URL.
 var bitbucketPRViews = map[string]bool{"diff": true, "commits": true, "overview": true}
 
-// ParseChangeRequestURL accepts complete GitHub PR and GitLab MR web URLs.
+// ParseChangeRequestURL accepts complete GitHub PR, GitLab MR and Bitbucket
+// Cloud PR web URLs.
 // It never fetches the URL or grants SCM tracking authority.
 func ParseChangeRequestURL(raw string) (ChangeRequestReference, error) {
 	if raw == "" || len(raw) > 2048 || strings.TrimSpace(raw) != raw {
@@ -81,6 +82,11 @@ func ParseChangeRequestURL(raw string) (ChangeRequestReference, error) {
 	}
 	name := repo.Namespace + "/" + repo.Name
 	host := repo.Host
+	if provider == "bitbucket" {
+		// Bitbucket treats workspace and slug case-insensitively.
+		name = strings.ToLower(name)
+		u.Scheme = "https"
+	}
 	if provider == "github" {
 		name = strings.ToLower(name)
 		u.Scheme = "https"

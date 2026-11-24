@@ -70,3 +70,35 @@ func TestInferTrackerProviderBitbucketHasNoTracker(t *testing.T) {
 		t.Fatalf("provider = %q", got)
 	}
 }
+
+func TestParseChangeRequestURLBitbucketNormalises(t *testing.T) {
+	ref, err := ParseChangeRequestURL("http://bitbucket.org/DealHubIO/Aura-SRE/pull-requests/12/diff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.URL != "https://bitbucket.org/dealhubio/aura-sre/pull-requests/12" || ref.Repository != "dealhubio/aura-sre" {
+		t.Fatalf("ref = %+v", ref)
+	}
+	if got, want := ref.Key(), "bitbucket|bitbucket.org|dealhubio/aura-sre|12"; got != want {
+		t.Fatalf("key = %q, want %q", got, want)
+	}
+}
+
+func TestBitbucketRepositoryIdentityPorts(t *testing.T) {
+	for _, raw := range []string{"ssh://git@bitbucket.org:22/ws/repo.git", "https://bitbucket.org:443/ws/repo"} {
+		id, err := ParseRepositoryIdentity(raw)
+		if err != nil || id.Host != "bitbucket.org" || id.Provider != "bitbucket" {
+			t.Fatalf("%s: id = %+v, err = %v", raw, id, err)
+		}
+	}
+	for _, raw := range []string{
+		"ssh://git@bitbucket.org:7999/ws/repo.git",
+		"https://bitbucket.org:8443/ws/repo",
+		"ssh://git@bitbucket.org:443/ws/repo.git",
+		"https://bitbucket.org:22/ws/repo",
+	} {
+		if _, err := ParseRepositoryIdentity(raw); err == nil {
+			t.Fatalf("%s: want error", raw)
+		}
+	}
+}

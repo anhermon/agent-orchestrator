@@ -75,10 +75,19 @@ func ParseRepositoryIdentity(raw string) (RepositoryIdentity, error) {
 		}
 	}
 	provider := RepositoryProvider(u.Hostname())
+	host := strings.ToLower(u.Host)
+	if provider == "bitbucket" && u.Port() != "" {
+		// Bitbucket Cloud serves only the scheme's default port, which is
+		// dropped so the host matches PR URLs and the SCM adapter.
+		if u.Port() != map[string]string{"ssh": "22", "http": "80", "https": "443"}[u.Scheme] {
+			return RepositoryIdentity{}, invalid
+		}
+		host = strings.ToLower(u.Hostname())
+	}
 	if (provider == "github" || provider == "bitbucket") && len(parts) != 2 {
 		return RepositoryIdentity{}, invalid
 	}
-	return RepositoryIdentity{Provider: provider, Host: strings.ToLower(u.Host), Namespace: strings.Join(parts[:len(parts)-1], "/"), Name: parts[len(parts)-1]}, nil
+	return RepositoryIdentity{Provider: provider, Host: host, Namespace: strings.Join(parts[:len(parts)-1], "/"), Name: parts[len(parts)-1]}, nil
 }
 
 // ValidateCanonicalRepository keeps an explicitly selected upstream on the
