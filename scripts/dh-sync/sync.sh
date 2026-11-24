@@ -1,35 +1,45 @@
 #!/usr/bin/env bash
 # Upstream sync job for the DealHub fork of agent-orchestrator.
 #
-# Fast-forwards origin/main from upstream/main, then merges upstream into dh/main
-# on a sync/<date> branch in a separate worktree. Conflicts or red checks are
-# escalated to a resolver (a Claude Code session by default); this script never
-# resolves a conflict itself, never pushes to upstream, never force-pushes.
+# 1. Fast-forwards origin/main from upstream/main.
+# 2. Merges upstream into dh/main on a local sync branch in a sibling worktree.
+#    Conflict-free merge with green checks: fast-forwards origin/dh/main (exit 0).
+# 3. Conflicts or red checks: a resolver (a restricted Claude Code session, edit-only,
+#    no git, no network) edits files in the worktree. THIS SCRIPT then verifies (no
+#    conflict markers, test-weakening guard, checks green), commits, and pushes ONLY to
+#    sync/upstream-<UTC yyyymmdd-HHMM>. dh/main is never changed by a resolved merge:
+#    a human/session lands the branch (exit 10).
+# Never pushes to upstream, never force-pushes, never touches the live checkout.
 #
-# Exit codes: 0 landed or nothing to do, 10 escalated and resolved (landed),
-#             20 unresolved (nothing merged, notified), 30 precondition failure.
+# Exit codes: 0 landed or nothing to do, 10 resolved and pushed to a sync branch awaiting
+#             land, 20 unresolved (dh/main untouched, notified), 30 precondition failure.
+# Bash 3.2 compatible (macOS default).
+# shellcheck disable=SC2329 # functions are invoked indirectly (traps, run_limited)
 set -u
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO=/Users/angelhermon/workspace/agent-orchestrator
-CHECKS="$SCRIPT_DIR/checks.sh"
-# shellcheck disable=SC2016 # expanded later by the bash -c that runs the resolver
-RESOLVER='claude -p --max-turns 60 --permission-mode acceptEdits "$(cat "$AO_SYNC_PROMPT")"'
-NOTIFY="$SCRIPT_DIR/notify.sh"
+CHECKS=("$SCRIPT_DIR/checks.sh")
+NOTIFY=("$SCRIPT_DIR/notify.sh")
+RESOLVER_PROGRAM="" # empty: built-in restricted claude resolver
 DRY_RUN=0
 DEBUG=0
 TICKET=INT-20261123-ao-bitbucket
+RESOLVER_TIMEOUT="${AO_SYNC_RESOLVER_TIMEOUT:-2700}"
+CHECKS_TIMEOUT="${AO_SYNC_CHECKS_TIMEOUT:-3600}"
+LOG_RETENTION_DAYS=30
 
 usage() {
-  echo "usage: sync.sh [--repo PATH] [--checks CMD] [--resolver CMD] [--notify CMD] [--dry-run] [--debug]"
+  echo "usage: sync.sh [--repo PATH] [--checks PROGRAM] [--resolver PROGRAM] [--notify PROGRAM] [--dry-run] [--debug]"
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="$2"; shift 2 ;;
-    --checks) CHECKS="$2"; shift 2 ;;
-    --resolver) RESOLVER="$2"; shift 2 ;;
-    --notify) NOTIFY="$2"; shift 2 ;;
+    --checks) CHECKS=("$2"); shift 2 ;;
+    --resolver) RESOLVER_PROGRAM="$2"; shift 2 ;;
+    --notify) NOTIFY=("$2"); shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --debug) DEBUG=1; shift ;;
     -h | --help) usage; exit 0 ;;
@@ -39,6 +49,7 @@ done
 
 LOG_DIR="${AO_SYNC_LOG_DIR:-$HOME/Library/Logs/ao-sync}"
 mkdir -p "$LOG_DIR"
+chmod 700 "$LOG_DIR"
 STAMP="$(date +%Y%m%dT%H%M%S)"
 RUN_LOG="$LOG_DIR/$STAMP.log"
 exec 3>&1
@@ -52,59 +63,164 @@ err() { log ERROR "$1"; }
 UPSTREAM_SHA=unknown
 BRANCH=-
 LOCK=""
+OWN_LOCK=0
 WT=""
 NOTIFY_STATUS=""
+SKIPPED=""
+FINISHED=0
+CHILD=""
+CHECKS_OUT=""
+DH_BASE=""
+MERGE_COMMIT=""
+CONFLICT=0
 
 git_repo() { git -C "$REPO" "$@"; }
 
-# The only push path. Never targets upstream, never forces.
-push_origin() { git_repo push origin "$1"; }
+# Pushes from the worktree. Refspec must be explicit, never forced. Remote is always origin.
+push_wt() { # push_wt <refspec>
+  case "$1" in
+    +* | "") err "refusing refspec '$1'"; return 1 ;;
+  esac
+  git -C "$WT" push origin "$1"
+}
 
-finish() { # finish <result> <exit code>
-  local line
-  line="$(date +%FT%T%z) upstream=${UPSTREAM_SHA:0:12} result=$1 branch=$BRANCH${NOTIFY_STATUS:+ $NOTIFY_STATUS}"
-  echo "$line" >>"$LOG_DIR/sync.log"
-  echo "$line" >&3
-  cleanup
-  exit "$2"
+kill_tree() { # kill_tree <pid>
+  pkill -TERM -P "$1" 2>/dev/null
+  kill -TERM "$1" 2>/dev/null
+  return 0
+}
+
+# Runs a command in the background with a time limit; signals interrupt the wait.
+run_limited() { # run_limited <seconds> <command...>
+  local secs="$1" rc watcher
+  shift
+  "$@" &
+  CHILD=$!
+  (
+    sleep "$secs"
+    log WARN "timeout after ${secs}s: $1"
+    kill_tree "$CHILD"
+    sleep 10
+    kill -KILL "$CHILD" 2>/dev/null
+  ) &
+  watcher=$!
+  wait "$CHILD"
+  rc=$?
+  kill "$watcher" 2>/dev/null
+  pkill -P "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
+  CHILD=""
+  return "$rc"
 }
 
 cleanup() {
+  [ -n "$CHECKS_OUT" ] && rm -f "$CHECKS_OUT"
   if [ -n "$WT" ] && [ -e "$WT" ]; then
     git_repo worktree remove --force "$WT" >/dev/null 2>&1 || rm -rf "$WT"
     git_repo worktree prune
   fi
-  [ -n "$LOCK" ] && rmdir "$LOCK" 2>/dev/null
+  if [ "$BRANCH" != "-" ] && [ -n "$WT" ]; then
+    git_repo branch -D "$BRANCH" >/dev/null 2>&1
+  fi
+  if [ "$OWN_LOCK" = 1 ]; then
+    rm -rf "$LOCK"
+  fi
   return 0
+}
+
+write_line() { # write_line <result>
+  local line
+  line="$(date +%FT%T%z) upstream=${UPSTREAM_SHA:0:12} result=$1 branch=$BRANCH${SKIPPED:+ skipped=$SKIPPED}${NOTIFY_STATUS:+ $NOTIFY_STATUS}"
+  echo "$line" >>"$LOG_DIR/sync.log"
+  echo "$line" >&3
+}
+
+on_exit() {
+  if [ "$FINISHED" = 0 ]; then
+    write_line aborted
+  fi
+  cleanup
+}
+on_signal() { # on_signal <exit code>
+  warn "received signal, stopping"
+  [ -n "$CHILD" ] && kill_tree "$CHILD"
+  exit "$1"
+}
+trap on_exit EXIT
+trap 'on_signal 143' TERM
+trap 'on_signal 130' INT
+
+finish() { # finish <result> <exit code>
+  FINISHED=1
+  write_line "$1"
+  exit "$2"
 }
 
 notify() {
   local out
-  out="$(bash -c "$NOTIFY \"\$1\"" _ "$1" 2>&1)"
+  out="$("${NOTIFY[@]}" "$1" 2>&1 </dev/null)"
   debug "notify output: $out"
   NOTIFY_STATUS="$(grep -o 'notify=[a-z-]*' <<<"$out" | tail -n 1)"
 }
 
+# Notifies at most once per UTC day per key (keeps a stuck state from spamming).
+notify_once() { # notify_once <key> <text>
+  local marker
+  marker="$LOG_DIR/.notified-$1-$(date -u +%F)"
+  if [ -e "$marker" ]; then
+    debug "already notified today: $1"
+    return 0
+  fi
+  : >"$marker"
+  notify "$2"
+}
+
 precondition() { # precondition <message>
   err "$1"
-  notify "AO sync: precondition failed: $1"
+  notify "AO sync: precondition failed: $1 (log: $RUN_LOG)"
   finish precondition 30
 }
 
-if [ ! -d "$REPO/.git" ] && ! git_repo rev-parse --git-dir >/dev/null 2>&1; then
+prune_logs() {
+  find "$LOG_DIR" -maxdepth 1 -type f \( -name '2*' -o -name '.notified-*' \) -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null
+  return 0
+}
+prune_logs
+
+if ! git_repo rev-parse --git-dir >/dev/null 2>&1; then
   err "not a git repo: $REPO"
+  notify_once not-a-repo "AO sync: $REPO is not a git repository"
   finish precondition 30
 fi
 
-# Lock (mkdir is atomic). Stale after 6 hours.
+# Lock: mkdir is atomic, the PID inside allows a liveness check.
 LOCK="$(git_repo rev-parse --path-format=absolute --git-common-dir)/ao-sync.lock"
-if [ -d "$LOCK" ] && [ -n "$(find "$LOCK" -maxdepth 0 -mmin +360)" ]; then
-  warn "removing stale lock $LOCK"
-  rmdir "$LOCK"
-fi
-if ! mkdir "$LOCK" 2>/dev/null; then
+acquire_lock() {
+  local pid
+  if mkdir "$LOCK" 2>/dev/null; then
+    echo $$ >"$LOCK/pid"
+    OWN_LOCK=1
+    return 0
+  fi
+  pid="$(cat "$LOCK/pid" 2>/dev/null)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  if [ -z "$pid" ] && [ -z "$(find "$LOCK" -maxdepth 0 -mmin +360)" ]; then
+    return 1 # no pid recorded yet and younger than 6h: assume another run is starting
+  fi
+  warn "removing stale lock $LOCK (pid=${pid:-none})"
+  rm -rf "$LOCK"
+  if mkdir "$LOCK" 2>/dev/null; then
+    echo $$ >"$LOCK/pid"
+    OWN_LOCK=1
+    return 0
+  fi
+  return 1
+}
+if ! acquire_lock; then
   err "lock held: $LOCK"
-  LOCK=""
+  notify_once lock-held "AO sync skipped: another run holds the lock ($LOCK)"
   finish precondition 30
 fi
 
@@ -124,14 +240,15 @@ if [ "$DRY_RUN" = 1 ]; then
   finish noop 0
 fi
 
-# Mirror main (fast-forward only; push without --force is rejected otherwise).
+# Mirror main (fast-forward only; a push without + is rejected otherwise).
 if [ "$ORIGIN_MAIN" != "$UPSTREAM_SHA" ]; then
   debug "fast-forwarding origin/main to $UPSTREAM_SHA"
-  push_origin "$UPSTREAM_SHA:refs/heads/main" || precondition "push of origin/main was rejected"
+  git_repo push origin "$UPSTREAM_SHA:refs/heads/main" || precondition "push of origin/main was rejected"
 fi
 
 if ! git_repo rev-parse --verify --quiet origin/dh/main >/dev/null; then
   warn "origin/dh/main does not exist yet; only mirrored main"
+  notify_once dh-main-missing "AO sync: origin/dh/main does not exist; only main was mirrored"
   finish noop 0
 fi
 
@@ -143,67 +260,186 @@ if git_repo merge-base --is-ancestor "$UPSTREAM_SHA" "$DH_BASE"; then
   finish landed 0
 fi
 
-BRANCH="sync/$(date +%F)"
+SHORT="${UPSTREAM_SHA:0:12}"
+BRANCH="sync/upstream-$(date -u +%Y%m%d-%H%M)"
 if git_repo rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null ||
   git_repo rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null; then
-  BRANCH="$BRANCH-$(date +%H%M%S)"
+  BRANCH="$BRANCH-$(date -u +%S)"
 fi
+
+# Leftover from a killed run: we hold the lock, so nobody else owns this path.
 WT="$(dirname "$REPO")/$(basename "$REPO")-sync"
+git_repo worktree prune
 if [ -e "$WT" ]; then
-  precondition "worktree path already exists: $WT"
+  warn "removing leftover sync worktree $WT"
+  git_repo worktree remove --force "$WT" >/dev/null 2>&1 || rm -rf "$WT"
+  git_repo worktree prune
 fi
 git_repo worktree add --quiet -b "$BRANCH" "$WT" "$DH_BASE" || precondition "could not create worktree $WT"
 
-SHORT="${UPSTREAM_SHA:0:12}"
-export AO_SYNC_PROMPT="$SCRIPT_DIR/resolve-prompt.md"
+CHECKS_OUT="$(mktemp "$LOG_DIR/.checks.XXXXXX")"
 export AO_SYNC_UPSTREAM_SHA="$UPSTREAM_SHA"
 export AO_SYNC_BRANCH="$BRANCH"
 export AO_SYNC_TICKET="$TICKET"
 
-run_checks() { (cd "$WT" && bash -c "$CHECKS"); }
+attached() { [ "$(git -C "$WT" symbolic-ref -q --short HEAD)" = "$BRANCH" ]; }
 
-needs_resolver=0
-if git -C "$WT" merge --no-ff -q -m "🔀 merge: sync upstream $SHORT" -m "Refs: $TICKET" "$UPSTREAM_SHA"; then
-  debug "clean merge; running checks"
-  run_checks || { warn "checks red after clean merge"; needs_resolver=1; }
-else
-  warn "merge conflict"
-  needs_resolver=1
-fi
+checks_inner() { (cd "$WT" && "${CHECKS[@]}") >"$CHECKS_OUT" 2>&1; }
 
-if [ "$needs_resolver" = 0 ]; then
-  push_origin "$BRANCH:refs/heads/dh/main" || precondition "push of dh/main was rejected"
-  finish landed 0
-fi
+# Runs the checks (with timeout); records skipped items so a skip is never reported as plain green.
+run_checks() {
+  local rc
+  run_limited "$CHECKS_TIMEOUT" checks_inner
+  rc=$?
+  cat "$CHECKS_OUT"
+  SKIPPED="$(sed -n 's/^CHECKS_SKIPPED=//p' "$CHECKS_OUT" | tail -n 1)"
+  [ -n "$SKIPPED" ] && warn "checks green with skips: $SKIPPED"
+  return "$rc"
+}
 
-debug "escalating to resolver: $RESOLVER"
-(cd "$WT" && bash -c "$RESOLVER")
-log INFO "resolver exited with $?"
+render_prompt() {
+  local tpl
+  tpl="$(cat "$SCRIPT_DIR/resolve-prompt.md")" || return 1
+  tpl="${tpl//@SHA@/$UPSTREAM_SHA}"
+  tpl="${tpl//@BRANCH@/$BRANCH}"
+  tpl="${tpl//@TICKET@/$TICKET}"
+  printf '%s\n' "$tpl"
+}
 
-# Never trust the resolver's claim: verify the result ourselves.
+# Edit-only Claude session: no git, no network, no MCP, project settings (upstream-controlled) ignored.
+# Edits outside the worktree are not auto-approved by acceptEdits and are denied in -p mode.
+claude_resolver() {
+  cd "$WT" || return 1
+  render_prompt | claude -p --max-turns 60 --permission-mode acceptEdits \
+    --setting-sources local --strict-mcp-config \
+    --tools "Read,Edit,Write,Grep,Glob,Bash" \
+    --allowedTools "Read,Edit,Write,Grep,Glob,Bash(git diff:*),Bash(git status:*)" \
+    --disallowedTools "WebFetch,WebSearch,Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git checkout:*),Bash(git switch:*),Bash(git reset:*),Bash(git merge:*),Bash(git remote:*)"
+}
+resolver_inner() {
+  if [ -n "$RESOLVER_PROGRAM" ]; then
+    (cd "$WT" && "$RESOLVER_PROGRAM")
+  else
+    claude_resolver
+  fi
+}
+
+# --- Test-weakening guard (heuristic, documented in README) -------------------------------
+# Compares the staged result against BOTH parents. Only changes the resolver authored count:
+# something deleted/added/removed relative to both parents (a one-sided upstream or fork
+# change is legitimate). Flags: (1) a test file present in both parents but deleted,
+# (2) added skip/only markers in test files, (3) removed assertion lines in test files.
+TEST_RE='(_test\.go|\.test\.(ts|tsx|js|jsx|mjs)|\.spec\.(ts|tsx|js|jsx))$'
+SKIP_RE='(t\.Skip(Now|f)?\(|\.skip\(|(^|[^A-Za-z])x(it|describe|test)\(|\.only\()'
+ASSERT_RE='(expect\(|assert[A-Za-z_.]*\(|require\.[A-Za-z]+\(|t\.(Error|Errorf|Fatal|Fatalf)\()'
+
+deleted_tests() { git -C "$WT" diff --cached --diff-filter=D --name-only "$1" | grep -E "$TEST_RE" | sort -u; }
+
+# test_lines <parent> <+|-> : "path<TAB>line" for added/removed lines in test files (paths without spaces).
+test_lines() {
+  git -C "$WT" diff --cached -U0 "$1" | awk -v sign="$2" -v re="$TEST_RE" '
+    /^diff --git / { f = $4; sub(/^b\//, "", f); next }
+    /^(\+\+\+|---) / { next }
+    substr($0, 1, 1) == sign && f ~ re { print f "\t" substr($0, 2) }'
+}
+
+both_parents() { # both_parents <sign> <line regex>: lines changed relative to both parents
+  comm -12 \
+    <(test_lines "$DH_BASE" "$1" | grep -E "$2" | sort -u) \
+    <(test_lines "$UPSTREAM_SHA" "$1" | grep -E "$2" | sort -u)
+}
+
+weakening_guard() {
+  local out rc=0
+  out="$(comm -12 <(deleted_tests "$DH_BASE") <(deleted_tests "$UPSTREAM_SHA"))"
+  [ -n "$out" ] && { err "guard: resolver deleted test files: $out"; rc=1; }
+  out="$(both_parents + "$SKIP_RE")"
+  [ -n "$out" ] && { err "guard: resolver added skip markers: $out"; rc=1; }
+  out="$(both_parents - "$ASSERT_RE")"
+  [ -n "$out" ] && { err "guard: resolver removed assertions: $out"; rc=1; }
+  return "$rc"
+}
+
+save_summary() {
+  [ -f "$WT/SYNC_SUMMARY.md" ] && cp "$WT/SYNC_SUMMARY.md" "$LOG_DIR/$STAMP-SUMMARY.md"
+  return 0
+}
+
 unresolved() { # unresolved <reason>
-  warn "$1"
-  if [ -f "$WT/.git" ] && git -C "$WT" rev-parse -q --verify MERGE_HEAD >/dev/null; then
+  local where msg
+  warn "unresolved: $1"
+  save_summary
+  if [ "$CONFLICT" = 1 ]; then
+    git -C "$WT" diff >"$LOG_DIR/$STAMP-conflict.diff" 2>/dev/null
+  fi
+  if git -C "$WT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
     git -C "$WT" merge --abort
   fi
-  # Preserve the attempt on the sync branch only if it is a descendant of dh/main with upstream merged.
-  if git -C "$WT" merge-base --is-ancestor "$UPSTREAM_SHA" HEAD 2>/dev/null; then
-    push_origin "$BRANCH:refs/heads/$BRANCH" || warn "could not push $BRANCH"
+  # A committed clean merge with red checks is preserved on the sync branch for inspection.
+  if [ -n "$MERGE_COMMIT" ] && git -C "$WT" push origin "$MERGE_COMMIT:refs/heads/$BRANCH" >/dev/null 2>&1; then
+    where="merge pushed to origin/$BRANCH for inspection"
+  elif [ "$CONFLICT" = 1 ]; then
+    where="nothing pushed; conflict diff in $LOG_DIR/$STAMP-conflict.diff"
+  else
+    where="nothing pushed"
   fi
-  notify "AO sync needs attention: upstream $SHORT unresolved ($1). Branch $BRANCH, worktree log $RUN_LOG"
+  msg="AO sync needs attention: upstream $SHORT unresolved ($1); $where; log $RUN_LOG"
+  notify "$msg"
   finish unresolved 20
 }
 
-git -C "$WT" rev-parse -q --verify MERGE_HEAD >/dev/null && unresolved "merge still in progress"
-git -C "$WT" merge-base --is-ancestor "$UPSTREAM_SHA" HEAD || unresolved "upstream not merged"
-git -C "$WT" merge-base --is-ancestor "$DH_BASE" HEAD || unresolved "dh/main history lost"
-[ -z "$(git -C "$WT" status --porcelain --untracked-files=no)" ] || unresolved "uncommitted changes left"
-if git -C "$WT" grep -qE '^(<<<<<<< |>>>>>>> )' -- . ':!*.md'; then
+land_dh() {
+  attached || precondition "worktree HEAD is not on $BRANCH; refusing to push dh/main"
+  push_wt "HEAD:refs/heads/dh/main" || precondition "push of dh/main was rejected"
+  [ "$(git -C "$WT" ls-remote origin refs/heads/dh/main | cut -f1)" = "$(git -C "$WT" rev-parse HEAD)" ] ||
+    precondition "origin/dh/main does not match the pushed commit"
+  finish landed 0
+}
+
+if git -C "$WT" merge --no-ff -q -m "🔀 merge: sync upstream $SHORT" -m "Refs: $TICKET" "$UPSTREAM_SHA"; then
+  MERGE_COMMIT="$(git -C "$WT" rev-parse HEAD)"
+  debug "clean merge $MERGE_COMMIT; running checks"
+  if run_checks; then
+    land_dh
+  fi
+  warn "checks red after clean merge"
+else
+  warn "merge conflict"
+  CONFLICT=1
+fi
+
+debug "escalating to resolver (program: ${RESOLVER_PROGRAM:-built-in claude})"
+run_limited "$RESOLVER_TIMEOUT" resolver_inner
+log INFO "resolver exited with $?"
+
+# Never trust the resolver's claim: verify the result ourselves.
+attached || unresolved "HEAD detached or switched away from $BRANCH"
+if [ "$CONFLICT" = 1 ]; then
+  git -C "$WT" rev-parse -q --verify MERGE_HEAD >/dev/null || unresolved "resolver committed or aborted the merge itself"
+else
+  [ "$(git -C "$WT" rev-parse HEAD)" = "$MERGE_COMMIT" ] || unresolved "resolver moved HEAD"
+fi
+git -C "$WT" add -A -- . ':!SYNC_SUMMARY.md'
+save_summary
+if git -C "$WT" diff --cached "$DH_BASE" | grep -qE '^\+(<<<<<<< |>>>>>>> )'; then
   unresolved "conflict markers remain"
+fi
+weakening_guard || unresolved "test-weakening guard tripped"
+if [ "$CONFLICT" = 0 ] && git -C "$WT" diff --cached --quiet; then
+  unresolved "resolver made no changes"
 fi
 run_checks || unresolved "checks red after resolver"
 
-push_origin "$BRANCH:refs/heads/dh/main" || unresolved "push of dh/main was rejected"
-[ -f "$WT/SYNC_SUMMARY.md" ] && cp "$WT/SYNC_SUMMARY.md" "$LOG_DIR/$STAMP-SUMMARY.md"
-notify "AO sync: upstream $SHORT merged into dh/main after conflict resolution. Review $LOG_DIR/$STAMP-SUMMARY.md"
+if [ "$CONFLICT" = 1 ]; then
+  git -C "$WT" commit -q -m "🔀 merge: sync upstream $SHORT" \
+    -m "Conflicts resolved by an automated Claude Code session; verified by sync.sh." -m "Refs: $TICKET"
+else
+  git -C "$WT" commit -q -m "🐛 fix(sync): adapt fork to upstream $SHORT" \
+    -m "Applied by an automated Claude Code session; verified by sync.sh." -m "Refs: $TICKET"
+fi
+attached || precondition "worktree HEAD is not on $BRANCH after commit"
+push_wt "HEAD:refs/heads/$BRANCH" || precondition "push of $BRANCH was rejected"
+[ "$(git -C "$WT" ls-remote origin "refs/heads/$BRANCH" | cut -f1)" = "$(git -C "$WT" rev-parse HEAD)" ] ||
+  precondition "origin/$BRANCH does not match the pushed commit"
+notify "AO sync: upstream $SHORT merged on origin/$BRANCH (checks green${SKIPPED:+, skipped: $SKIPPED}). dh/main NOT updated: land the branch. Summary: $LOG_DIR/$STAMP-SUMMARY.md"
 finish resolved 10
