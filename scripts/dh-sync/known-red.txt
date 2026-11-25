@@ -1,0 +1,56 @@
+# Known-red failures on dh/main. checks.sh fails only on failures NOT listed here (see regen-known-red.sh).
+# Format: kind|scope|name  (name * = whole package/file known red).
+# SEEDED 2026-11-25 from the untouched-code baseline, NOT from a full regeneration:
+#  - go|pkg|*     PACKAGE-LEVEL SEEDS: 12 packages red on this machine (missing external CLIs, 3 timeouts).
+#                 Narrow them to test level by running regen-known-red.sh, then keeping its output.
+#  - vitest|file|* PACKAGE-LEVEL SEEDS: 8 files red in the baseline vitest run.
+#  - tsc|file|code the baseline typecheck errors (module resolution, mostly TS2307), test level.
+go|github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/modelcatalog|*
+go|github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/opencodev2|*
+go|github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/codexappserver|*
+go|github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/kimiacp|*
+go|github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/persistenthost|*
+go|github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/ptyexec|*
+go|github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/tmux|*
+go|github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/gitworktree|*
+go|github.com/aoagents/agent-orchestrator/backend/internal/cli|*
+go|github.com/aoagents/agent-orchestrator/backend/internal/process|*
+go|github.com/aoagents/agent-orchestrator/backend/internal/service/chat|*
+go|github.com/aoagents/agent-orchestrator/backend/internal/service/session|*
+vitest|scripts/mac-differential-v2-updater.test.mjs|*
+vitest|scripts/verify-mac-artifact.test.mjs|*
+vitest|src/main/cloud-folder-push.test.ts|*
+vitest|src/main/import-folder-scan.test.ts|*
+vitest|src/renderer/lib/terminal-drop.test.ts|*
+vitest|src/shared/cli-link.test.ts|*
+vitest|src/shared/cli-shadow.test.ts|*
+vitest|vite.renderer.config.test.ts|*
+tsc|../packages/product-ui/src/AgentAvatar.tsx|TS2307
+tsc|../packages/product-ui/src/AgentAvatar.tsx|TS2322
+tsc|../packages/product-ui/src/AgentAvatar.tsx|TS2875
+tsc|../packages/product-ui/src/ExecutionContextView.tsx|TS2875
+tsc|../packages/product-ui/src/GithubAvatar.tsx|TS2875
+tsc|../packages/product-ui/src/NavRowHighlight.tsx|TS2875
+tsc|../packages/product-ui/src/PRSummaryDisplay.tsx|TS2307
+tsc|../packages/product-ui/src/PRSummaryDisplay.tsx|TS2875
+tsc|../packages/product-ui/src/PRSummaryDisplay.tsx|TS7006
+tsc|../packages/product-ui/src/ProjectViews.tsx|TS2307
+tsc|../packages/product-ui/src/ProjectViews.tsx|TS2875
+tsc|../packages/product-ui/src/SessionInspectorView.tsx|TS2307
+tsc|../packages/product-ui/src/SessionInspectorView.tsx|TS2875
+tsc|../packages/product-ui/src/SessionInspectorView.tsx|TS7006
+tsc|../packages/product-ui/src/SessionsBoardView.tsx|TS2307
+tsc|../packages/product-ui/src/SessionsBoardView.tsx|TS2875
+tsc|../packages/product-ui/src/SessionsBoardView.tsx|TS7006
+tsc|../packages/product-ui/src/SessionsBoardView.tsx|TS7031
+tsc|../packages/product-ui/src/TaskComposerView.tsx|TS18046
+tsc|../packages/product-ui/src/TaskComposerView.tsx|TS2307
+tsc|../packages/product-ui/src/TaskComposerView.tsx|TS2345
+tsc|../packages/product-ui/src/TaskComposerView.tsx|TS2875
+tsc|../packages/product-ui/src/UserAvatar.tsx|TS2307
+tsc|../packages/product-ui/src/UserAvatar.tsx|TS2875
+tsc|../packages/product-ui/src/external-link.ts|TS2307
+tsc|../packages/product-ui/src/icons.tsx|TS2307
+tsc|../packages/product-ui/src/icons.tsx|TS2875
+tsc|../packages/product-ui/src/overlay-auto-focus.ts|TS2307
+tsc|../packages/product-ui/src/utils.ts|TS2307

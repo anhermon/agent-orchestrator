@@ -92,7 +92,13 @@ func ParseRepositoryIdentity(raw string) (RepositoryIdentity, error) {
 	if (provider == "github" || provider == "bitbucket") && len(parts) != 2 {
 		return RepositoryIdentity{}, invalid
 	}
-	return RepositoryIdentity{Provider: provider, Host: host, Namespace: strings.Join(parts[:len(parts)-1], "/"), Name: parts[len(parts)-1]}, nil
+	namespace, name := strings.Join(parts[:len(parts)-1], "/"), parts[len(parts)-1]
+	if provider == "bitbucket" {
+		// Bitbucket workspace and repository slugs are case-insensitive and the
+		// adapter and PR URL parser lowercase them; match so aliases agree.
+		namespace, name = strings.ToLower(namespace), strings.ToLower(name)
+	}
+	return RepositoryIdentity{Provider: provider, Host: host, Namespace: namespace, Name: name}, nil
 }
 
 // ValidateCanonicalRepository keeps an explicitly selected upstream on the

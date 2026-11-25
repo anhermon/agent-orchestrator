@@ -194,3 +194,20 @@ func TestTrackerIDForIssue_PlainNumberGitHub(t *testing.T) {
 		t.Errorf("Native = %q, want owner/repo#42", id.Native)
 	}
 }
+
+func TestTrackerIDForIssue_PlainNumberBitbucketHasNoTracker(t *testing.T) {
+	svc := NewWithDeps(Deps{SCM: staticSCM{repo: ports.SCMRepo{
+		Provider: "bitbucket",
+		Host:     "bitbucket.org",
+		Owner:    "acme",
+		Name:     "widgets",
+		Repo:     "acme/widgets",
+	}}})
+
+	id, ok := svc.trackerIDForIssue(ports.SpawnConfig{IssueID: "5"}, domain.ProjectRecord{
+		RepoOriginURL: "https://bitbucket.org/acme/widgets.git",
+	})
+	if ok {
+		t.Fatalf("trackerIDForIssue = %+v, ok = true; a Bitbucket origin has no issue tracker, issue context must be skipped", id)
+	}
+}

@@ -16,7 +16,7 @@ ao project <subcommand> [args] [flags]
 
 Register a local git repo as a project so sessions can be spawned in it. The path must be an existing git repository on disk. With `--as-workspace`, the path may be a parent folder containing direct child git repositories; Orchestrator initializes/adopts the parent as the root repo and gitignores children.
 
-A repository with no remote needs `--default-branch`: Orchestrator does not take a default from the checked-out branch. Without it the command still registers the project and prints a warning, and sessions fail to start until `ao project set-config <id> --default-branch <branch>` sets one.
+A repository with no remote resolves its default branch locally (init.defaultBranch, then a single main or master, then the checked-out branch) and records it in ao.defaultBranch; pass `--default-branch` to choose another. If no default can be resolved the command still registers the project and prints a warning, and sessions fail to start until `ao project set-config <id> --default-branch <branch>` sets one.
 
 **Syntax:**
 ```
@@ -28,7 +28,7 @@ ao project add [flags]
 | Flag | Meaning | Default / Required |
 |---|---|---|
 | `--as-workspace` | Register a parent folder as a workspace project (root-as-repo plus direct child repos) | - |
-| `--default-branch string` | Base branch for new worktrees; needed when the repository has no remote. With `--as-workspace` it applies to the workspace's root repository; child repositories resolve their own | Resolved from the remote |
+| `--default-branch string` | Base branch for new worktrees; overrides the locally resolved default when the repository has no remote. With `--as-workspace` it applies to the workspace's root repository; child repositories resolve their own | Resolved from the remote, else locally |
 | `--id string` | Project id | Derived by the daemon from the path |
 | `--name string` | Display name | - |
 | `--orchestrator-agent string` | Default orchestrator session agent | - |

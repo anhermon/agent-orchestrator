@@ -61,6 +61,11 @@ func (p *Provider) CommitChecksGuard(ctx context.Context, repo ports.SCMRepo, he
 	var raw json.RawMessage
 	_, err := p.client.do(ctx, "GET", repoAPIPath(repo)+"/commit/"+url.PathEscape(headSHA)+"/statuses", q, nil, &raw)
 	if err != nil {
+		var rl *RateLimitError
+		if errors.As(err, &rl) {
+			// A throttle (403 with Retry-After) is not a missing scope: let the observer back off.
+			return ports.SCMGuardResult{}, err
+		}
 		if errors.Is(err, ports.ErrSCMForbidden) {
 			p.warnStatusesForbidden(repo)
 			return ports.SCMGuardResult{ETag: etag, NotModified: true}, nil

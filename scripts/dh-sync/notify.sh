@@ -8,8 +8,11 @@
 #   notify=osascript-failed     nothing but the status file
 # "sent" is the model's own confirmation of its tool call; it cannot be verified from here.
 # The Slack session loads user settings only (no project/local settings) and needs the claude.ai
-# Slack connector, so --strict-mcp-config cannot be used (documented residual: it also loads the
-# user's other MCP servers, but its prompt contains only the controlled notification text).
+# Slack connector, so --strict-mcp-config cannot be used (it also loads the user's other MCP servers).
+# The text may contain resolver- or upstream-authored strings (file names, check output), so the
+# prompt gets a sanitised copy (A-Za-z0-9 and . _ : / = ( ) , -; at most 400 chars) and the session
+# is denied every tool except the Slack send (--disallowedTools; UNVERIFIED offline: confirm the
+# flag form in a live run). The banner and status file keep the original text.
 # No --max-turns (not in claude --help): the session is bounded by a 120 s watcher.
 set -u
 
@@ -28,11 +31,13 @@ if ! osascript -e 'on run argv' -e 'display notification (item 1 of argv) with t
 fi
 
 slack=0
+safe="$(printf '%s' "$text" | tr -c 'A-Za-z0-9 ._:/=(),-' ' ' | tr -s ' ' | cut -c1-400)"
 if command -v claude >/dev/null 2>&1; then
   out="$(mktemp)"
   set -m
   claude -p --setting-sources user --allowedTools "$SLACK_TOOL" \
-    "Using the Slack MCP connector, send this exact text as a DM to Angel (at most 2 lines). Then reply with exactly SLACK_SENT if the send succeeded, or SLACK_FAILED if not. Text: $text" \
+    --disallowedTools "Read,Grep,Glob,Bash,Edit,Write,WebFetch,WebSearch" \
+    "Using the Slack MCP connector, send this exact text as a DM to Angel (at most 2 lines). Then reply with exactly SLACK_SENT if the send succeeded, or SLACK_FAILED if not. Text: $safe" \
     >"$out" 2>&1 </dev/null &
   pid=$!
   # The watcher must not hold the caller's stdout open ($(...) would wait for it).

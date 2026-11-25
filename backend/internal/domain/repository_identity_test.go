@@ -47,3 +47,23 @@ func TestCanonicalRepositoryValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestParseRepositoryIdentityLowercasesBitbucketNames(t *testing.T) {
+	for _, raw := range []string{
+		"git@bitbucket.org:DealHubIO/Aura-SRE.git",
+		"https://bitbucket.org/DealHubIO/Aura-SRE.git",
+	} {
+		got, err := ParseRepositoryIdentity(raw)
+		if err != nil {
+			t.Fatalf("%q: %v", raw, err)
+		}
+		if got.Namespace != "dealhubio" || got.Name != "aura-sre" {
+			t.Fatalf("%q: namespace/name = %q/%q, want dealhubio/aura-sre (as the SCM adapter and PR URL parser produce)", raw, got.Namespace, got.Name)
+		}
+	}
+	// GitHub keeps the case it was given.
+	got, err := ParseRepositoryIdentity("https://github.com/Acme/Repo.git")
+	if err != nil || got.Namespace != "Acme" || got.Name != "Repo" {
+		t.Fatalf("github identity = %+v, %v; want case preserved", got, err)
+	}
+}

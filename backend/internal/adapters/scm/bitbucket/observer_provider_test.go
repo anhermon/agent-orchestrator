@@ -266,6 +266,35 @@ func TestCommitChecksGuardForbiddenDegradesAndWarnsOnce(t *testing.T) {
 	}
 }
 
+func TestCommitChecksGuardThrottled403PropagatesWithoutScopeWarn(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	_, p := newFakeWithLogger(t, map[string]route{
+		repoPath + "/commit/" + sha + "/statuses": {status: http.StatusForbidden, body: `{}`, header: map[string]string{"Retry-After": "30"}},
+	}, logger)
+	_, err := p.CommitChecksGuard(context.Background(), testRepo, sha, "prev")
+	var rl interface{ GetRetryAfter() time.Duration }
+	if !errors.As(err, &rl) || rl.GetRetryAfter() != 30*time.Second {
+		t.Fatalf("err = %v, want a rate-limit error with Retry-After 30s", err)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Fatalf("a throttle was logged as a token-scope problem:\n%s", buf.String())
+	}
+}
+
+func TestFetchCIThrottled403Propagates(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	_, p := newFake(t, map[string]route{
+		repoPath + "/commit/" + sha + "/statuses": {status: http.StatusForbidden, body: `{}`, header: map[string]string{"Retry-After": "30"}},
+	})
+	_, err := p.fetchCI(context.Background(), testRepo, sha)
+	var rl interface{ GetRetryAfter() time.Duration }
+	if !errors.As(err, &rl) {
+		t.Fatalf("err = %v, want a rate-limit error", err)
+	}
+}
+
 func TestCommitChecksGuardEmptySHA(t *testing.T) {
 	_, p := newFake(t, nil)
 	if _, err := p.CommitChecksGuard(context.Background(), testRepo, "", ""); !errors.Is(err, ports.ErrSCMNotFound) {

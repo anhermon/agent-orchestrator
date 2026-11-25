@@ -3,6 +3,7 @@ package importer
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -356,7 +357,76 @@ func TestValidateProjectImportBitbucketOriginContinues(t *testing.T) {
 			t.Fatalf("origin %s: result = %#v, want valid continue", origin, result)
 		}
 		wantActions(t, result.Root.RequiredActions, []string{})
+		if !result.Root.HasOrigin {
+			t.Fatalf("origin %s: HasOrigin = false", origin)
+		}
+		got, err := exec.Command("git", "-C", repo, "config", "--get", "remote.origin.url").Output()
+		if err != nil {
+			t.Fatalf("git remote get-url: %v", err)
+		}
+		if host := importTestRemoteHost(t, strings.TrimSpace(string(got))); host != "bitbucket.org" {
+			t.Fatalf("origin host = %q, want bitbucket.org (url %q)", host, got)
+		}
+		for _, action := range result.Root.RequiredActions {
+			if action == GitPreparationActionCreateRemoteRepository {
+				t.Fatalf("origin %s: returned %s for a bitbucket origin", origin, action)
+			}
+		}
 	}
+}
+
+// importTestRemoteHost extracts the host from an https or scp-style git remote URL.
+func importTestRemoteHost(t *testing.T, raw string) string {
+	t.Helper()
+	if strings.HasPrefix(raw, "git@") {
+		host, _, _ := strings.Cut(strings.TrimPrefix(raw, "git@"), ":")
+		return host
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse remote %q: %v", raw, err)
+	}
+	return u.Hostname()
+}
+
+func TestValidateProjectImportNonGitFolderStillGetsGitHubCreation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	svc := New(Deps{Store: newFakeStore()})
+
+	result, err := svc.Validate(ctx, ImportValidationInput{ImportKind: ImportKindProject, Path: root})
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if result.NextStep != ImportNextStepPrepareGit {
+		t.Fatalf("result = %#v, want prepare_git for a non-git folder", result)
+	}
+	var sawInit, sawCreate bool
+	for _, action := range result.Root.RequiredActions {
+		sawInit = sawInit || action == GitPreparationActionInit
+		sawCreate = sawCreate || action == GitPreparationActionCreateRemoteRepository
+	}
+	if !sawInit || !sawCreate {
+		t.Fatalf("actions = %#v, want git_init and create_remote_repository for a non-git folder", result.Root.RequiredActions)
+	}
+}
+
+func TestValidateProjectImportGitLabOriginKeepsUpstreamBehavior(t *testing.T) {
+	ctx := context.Background()
+	repo := gitRepoWithCommitWithOrigin(t, t.TempDir(), "https://gitlab.com/acme/widgets.git")
+	svc := New(Deps{Store: newFakeStore()})
+
+	result, err := svc.Validate(ctx, ImportValidationInput{ImportKind: ImportKindProject, Path: repo})
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !result.IsValid || result.NextStep != ImportNextStepContinue {
+		t.Fatalf("result = %#v, want valid continue for a gitlab origin", result)
+	}
+	if !result.Root.HasOrigin {
+		t.Fatalf("HasOrigin = false for a gitlab origin")
+	}
+	wantActions(t, result.Root.RequiredActions, []string{})
 }
 
 func TestValidateProjectImportGitHubOriginContinues(t *testing.T) {

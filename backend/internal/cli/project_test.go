@@ -756,3 +756,16 @@ func TestProjectRemove_YesSkipsConfirmationAndSupportsBackendRemoveEnvelope(t *t
 		t.Fatalf("--yes output should skip prompt and print removal:\n%s", out)
 	}
 }
+
+func TestProjectAddHelpDescribesLocalDefaultForRemotelessRepos(t *testing.T) {
+	out, _, err := executeCLI(t, Deps{}, "project", "add", "--help")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "needs --default-branch") || strings.Contains(out, "needed when the repository has no remote") {
+		t.Errorf("help still says a remoteless repo needs --default-branch: %s", out)
+	}
+	if !strings.Contains(out, "init.defaultBranch") || !strings.Contains(out, "checked-out branch") {
+		t.Errorf("help must describe the local default resolution: %s", out)
+	}
+}

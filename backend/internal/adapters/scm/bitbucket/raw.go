@@ -14,7 +14,7 @@ import (
 // that serve plain text (pipeline step logs). headers are added to the request.
 // Errors follow the same classification as do.
 func (c *client) doRaw(ctx context.Context, path string, headers map[string]string) ([]byte, error) {
-	creds, err := c.creds.Credentials(ctx)
+	creds, err := c.credentials(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -42,6 +42,7 @@ func (c *client) doRaw(ctx context.Context, path string, headers map[string]stri
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return raw, nil
 	case resp.StatusCode == http.StatusUnauthorized:
+		c.clearCredentials()
 		return nil, fmt.Errorf("bitbucket scm: GET %s: %w", req.URL.Path, newAPIError(resp, raw, ErrAuthFailed))
 	case resp.StatusCode == http.StatusForbidden:
 		return nil, fmt.Errorf("bitbucket scm: GET %s: %w", req.URL.Path, throttleError(newAPIError(resp, raw, ports.ErrSCMForbidden)))

@@ -263,8 +263,9 @@ func newProjectAddCommand(ctx *commandContext) *cobra.Command {
 			"The path must be an existing git repository on disk. With --as-workspace, " +
 			"the path may be a parent folder containing direct child git repositories; " +
 			"Orchestrator initializes/adopts the parent as the root repo and gitignores children.\n\n" +
-			"A repository with no remote needs --default-branch: Orchestrator does not " +
-			"take a default from the checked-out branch.",
+			"A repository with no remote resolves its default branch locally " +
+			"(init.defaultBranch, then a single main or master, then the checked-out branch) " +
+			"and records it in ao.defaultBranch; pass --default-branch to choose another.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if opts.path == "" {
@@ -307,7 +308,7 @@ func newProjectAddCommand(ctx *commandContext) *cobra.Command {
 	f.StringVar(&opts.name, "name", "", "Display name")
 	f.StringVar(&opts.workerAgent, "worker-agent", "", "Default worker session agent")
 	f.StringVar(&opts.orchestratorAgent, "orchestrator-agent", "", "Default orchestrator session agent")
-	f.StringVar(&opts.defaultBranch, "default-branch", "", "Base branch for new worktrees; needed when the repository has no remote")
+	f.StringVar(&opts.defaultBranch, "default-branch", "", "Base branch for new worktrees; overrides the locally resolved default when the repository has no remote")
 	f.BoolVar(&opts.asWorkspace, "as-workspace", false, "Register a parent folder as a workspace project (root-as-repo plus direct child repos)")
 	return cmd
 }

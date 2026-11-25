@@ -19,7 +19,7 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 mkdir -p "$DEST" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/ao-sync"
-cp "$HERE"/sync.sh "$HERE"/checks.sh "$HERE"/notify.sh "$HERE"/resolve-prompt.md "$DEST"/
+cp "$HERE"/sync.sh "$HERE"/checks.sh "$HERE"/notify.sh "$HERE"/known-red.sh "$HERE"/known-red.txt "$HERE"/resolve-prompt.md "$DEST"/
 chmod +x "$DEST"/*.sh
 sed -e "s|__SCRIPT_DIR__|$DEST|g" -e "s|__HOME__|$HOME|g" "$HERE/$LABEL.plist" >"$PLIST"
 plutil -lint "$PLIST" >/dev/null

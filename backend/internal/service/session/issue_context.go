@@ -62,6 +62,11 @@ func (s *Service) trackerIDForIssue(cfg ports.SpawnConfig, project domain.Projec
 func (s *Service) repoForTracker(project domain.ProjectRecord, fallbackProvider domain.TrackerProvider) (domain.TrackerProvider, string, string, bool) {
 	if s.scm != nil {
 		repo, ok := s.scm.ParseRepository(project.RepoOriginURL)
+		if ok && repo.Provider == "bitbucket" {
+			// DH fork: Bitbucket is an SCM provider only; there is no Bitbucket
+			// tracker adapter, so a plain issue number has nowhere to resolve.
+			return "", "", "", false
+		}
 		if ok && repo.Provider != "" && repo.Repo != "" {
 			// SCM classified the origin (e.g. "github" or "gitlab"). Use the
 			// resolved provider so the multi-tracker dispatches to the

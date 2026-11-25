@@ -183,6 +183,10 @@ func (p *Provider) fetchCI(ctx context.Context, repo ports.SCMRepo, headSHA stri
 		return nil
 	})
 	if err != nil {
+		var rl *RateLimitError
+		if errors.As(err, &rl) {
+			return ports.SCMCIObservation{}, err
+		}
 		if errors.Is(err, ports.ErrSCMForbidden) {
 			p.warnStatusesForbidden(repo)
 			return ciObservation(headSHA, nil), nil

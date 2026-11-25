@@ -77,6 +77,10 @@ PRE_INDEX=""
 DH_BASE=""
 MERGE_COMMIT=""
 CONFLICT=0
+KEEP_WT=0
+RESOLVER_SETTINGS=""
+# gitleaks program: empty = look on PATH, "none" = never use it (regex scan only), else a path.
+GITLEAKS="${AO_SYNC_GITLEAKS:-}"
 
 git_repo() { git -C "$REPO" "$@"; }
 
@@ -145,11 +149,14 @@ cleanup() {
   [ -n "$PRE_INDEX" ] && rm -f "$PRE_INDEX"
   [ -n "$CHECKS_OUT" ] && rm -f "$CHECKS_OUT"
   [ -n "$RESOLVER_OUT" ] && rm -f "$RESOLVER_OUT"
-  if [ "$WT_CREATED" = 1 ] && wt_registered "$WT"; then
+  [ -n "$RESOLVER_SETTINGS" ] && rm -f "$RESOLVER_SETTINGS"
+  if [ "$KEEP_WT" = 1 ]; then
+    : # needs-human: the worktree and local branch are the only copy of the resolver's work
+  elif [ "$WT_CREATED" = 1 ] && wt_registered "$WT"; then
     git_repo worktree remove --force "$WT" >/dev/null 2>&1 || rm -rf "$WT"
     git_repo worktree prune
   fi
-  if [ "$WT_CREATED" = 1 ] && [ "$BRANCH" != "-" ]; then
+  if [ "$WT_CREATED" = 1 ] && [ "$BRANCH" != "-" ] && [ "$KEEP_WT" = 0 ]; then
     git_repo branch -D "$BRANCH" >/dev/null 2>&1
   fi
   if [ "$OWN_LOCK" = 1 ]; then
@@ -340,6 +347,7 @@ RESOLVER_OUT="$(mktemp "$LOG_DIR/.resolver.XXXXXX")"
 export AO_SYNC_UPSTREAM_SHA="$UPSTREAM_SHA"
 export AO_SYNC_BRANCH="$BRANCH"
 export AO_SYNC_TICKET="$TICKET"
+export AO_SYNC_LOG_DIR="$LOG_DIR"
 
 attached() { [ "$(git -C "$WT" symbolic-ref -q --short HEAD)" = "$BRANCH" ]; }
 
@@ -350,8 +358,13 @@ run_checks() {
   local rc
   run_limited "$CHECKS_TIMEOUT" checks_inner
   rc=$?
-  cat "$CHECKS_OUT"
-  SKIPPED="$(sed -n 's/^CHECKS_SKIPPED=//p' "$CHECKS_OUT" | tail -n 1)"
+  # Keep the run log bounded: the last 2000 lines always, the full output only when the checks failed.
+  if [ "$rc" != 0 ]; then
+    cp "$CHECKS_OUT" "$LOG_DIR/$STAMP-checks-full.log"
+  fi
+  tail -n 2000 "$CHECKS_OUT"
+  # Upstream test output can print CHECKS_SKIPPED=...: keep only a safe, short token list.
+  SKIPPED="$(sed -n 's/^CHECKS_SKIPPED=//p' "$CHECKS_OUT" | tail -n 1 | tr -cd 'A-Za-z0-9,._ -' | cut -c1-200)"
   [ -n "$SKIPPED" ] && warn "checks green with skips: $SKIPPED"
   return "$rc"
 }
@@ -365,14 +378,47 @@ render_prompt() {
   printf '%s\n' "$tpl"
 }
 
-# Edit-only Claude session: file tools only (no Bash, no git, no network, no MCP), project settings
-# (upstream-controlled) ignored. Edits outside the worktree are not auto-approved by acceptEdits and
-# are denied in -p mode. No --max-turns: it is not documented in claude --help; runtime is bounded
-# by run_limited instead. Output is kept so a rejected-arguments failure is recognised.
+# Settings for the resolver session, written by THIS script (never read from the worktree): deny
+# rules for the home-directory credential stores, system config and the live checkout, and no
+# hooks. The worktree's own settings (.claude/settings*.json, upstream-controlled or left behind by
+# a session) must not load: see refuse_worktree_settings and --setting-sources below.
+write_resolver_settings() {
+  local home_dir="${HOME:-/nonexistent}" rules="" p
+  for p in .ssh .aws .config .gnupg .claude .kube .docker .netrc .npmrc .gitconfig .git-credentials Library; do
+    rules="$rules${rules:+,}\"Read(//${home_dir#/}/$p/**)\",\"Edit(//${home_dir#/}/$p/**)\",\"Write(//${home_dir#/}/$p/**)\""
+  done
+  for p in etc private/etc var/root; do
+    rules="$rules,\"Read(//$p/**)\",\"Edit(//$p/**)\",\"Write(//$p/**)\""
+  done
+  rules="$rules,\"Read(//${REPO#/}/**)\",\"Edit(//${REPO#/}/**)\",\"Write(//${REPO#/}/**)\""
+  RESOLVER_SETTINGS="$(mktemp "$LOG_DIR/.resolver-settings.XXXXXX")"
+  printf '{\n  "disableAllHooks": true,\n  "permissions": {\n    "defaultMode": "acceptEdits",\n    "deny": [%s]\n  }\n}\n' "$rules" >"$RESOLVER_SETTINGS"
+}
+
+# A worktree that carries Claude settings is never handed to a resolver (belt and braces next to
+# --setting-sources): the settings could carry hooks or allow rules.
+refuse_worktree_settings() {
+  local f
+  for f in "$WT/.claude/settings.json" "$WT/.claude/settings.local.json"; do
+    [ -e "$f" ] && { echo "${f#"$WT"/}"; return 0; }
+  done
+  return 1
+}
+
+# Edit-only Claude session: file tools only (no Bash, no git, no network, no MCP), the script-owned
+# settings file above, and NO setting sources (the worktree's, the user's and the project's settings
+# are not loaded). No --max-turns: it is not documented in claude --help; runtime is bounded by
+# run_limited instead. Output is kept so a rejected-arguments failure is recognised.
+# UNVERIFIED offline (confirm with a live run before relying on them):
+#   - --settings <file> loads as an additional layer even with an empty --setting-sources value;
+#   - an empty --setting-sources "" is accepted and loads no settings file at all;
+#   - Read/Edit/Write deny rules written as Read(//abs/path/**) also gate Grep and Glob;
+#   - the worktree CLAUDE.md is still read as context (it is data, rule 5 of the prompt).
+# A rejected flag is not silent: it surfaces as "claude rejected its arguments" below.
 claude_resolver() {
   cd "$WT" || return 1
   render_prompt | claude -p --permission-mode acceptEdits \
-    --setting-sources local --strict-mcp-config \
+    --settings "$RESOLVER_SETTINGS" --setting-sources "" --strict-mcp-config \
     --tools "Read,Edit,Write,Grep,Glob" \
     --allowedTools "Read,Edit,Write,Grep,Glob" \
     --disallowedTools "WebFetch,WebSearch,Bash"
@@ -399,7 +445,10 @@ SKIP_RE='(t\.Skip(Now|f)?\(|\.skip\(|\.skipIf\(|\.todo\(|\.fixme\(|(^|[^A-Za-z])
 REMOVED_RE='(expect\(|assert[A-Za-z_.]*\(|require\.[A-Za-z]+\(|t\.(Error|Errorf|Fatal|Fatalf|Run)\(|func Test[A-Za-z0-9_]*\(|(^|[^A-Za-z])(it|test|describe)(\.each)?\()'
 # Build/test configuration whose resolver-authored change must never auto-land: it runs code when
 # checks run (npm scripts, .npmrc, go.work, Makefile/Taskfile) or changes what tests run.
-CONFIG_RE='(^|/)(package\.json|\.npmrc|go\.work|Makefile|Taskfile\.ya?ml|vitest\.[a-z.]*config\.[a-z]+|vite\.[a-z.]*config\.[a-z]+|playwright\.config\.[a-z]+|\.golangci\.ya?ml|\.github/workflows/[^/]+)$'
+# Also lockfiles and go.mod/go.sum (npm ci and go build execute or fetch what they pin), and files
+# later agent sessions in the fork load as instructions or tools (.claude/, .mcp.json, CLAUDE.md,
+# AGENTS.md).
+CONFIG_RE='((^|/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|go\.mod|go\.sum|\.npmrc|go\.work|Makefile|Taskfile\.ya?ml|vitest\.[a-z.]*config\.[a-z]+|vite\.[a-z.]*config\.[a-z]+|playwright\.config\.[a-z]+|\.golangci\.ya?ml|\.mcp\.json|CLAUDE\.md|AGENTS\.md|\.github/workflows/[^/]+)$|(^|/)\.claude/)'
 
 # Test files removed or renamed away relative to a parent (old paths).
 gone_tests() { # gone_tests <parent>
@@ -513,29 +562,114 @@ fi
 
 PRE_INDEX="$(mktemp "$LOG_DIR/.preindex.XXXXXX")"
 snapshot_index
+
+# needs_human <reason>: the resolver's result must not leave this machine. Nothing is pushed to origin
+# (it is public); the work stays on the LOCAL branch in the sync worktree, which is kept.
+needs_human() {
+  local files
+  warn "needs human: $1"
+  KEEP_WT=1
+  save_summary
+  files="$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$files" != 0 ] || git -C "$WT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    commit_local || warn "could not commit the resolver's work locally; it is left uncommitted in the worktree"
+  fi
+  notify "AO sync NEEDS HUMAN: $1. NOTHING was pushed to origin; dh/main untouched. Local branch $BRANCH in worktree $WT (the next sync run removes the worktree, not the branch). Log $RUN_LOG"
+  finish needs-human 20
+}
+
+if cfgfile="$(refuse_worktree_settings)"; then
+  # unresolved (not needs_human): the resolver never ran, so there is nothing of its to keep.
+  unresolved "worktree carries $cfgfile; the resolver was not started"
+fi
+
+write_resolver_settings
 debug "escalating to resolver (program: ${RESOLVER_PROGRAM:-built-in claude})"
 run_limited "$RESOLVER_TIMEOUT" resolver_inner
 rrc=$?
 log INFO "resolver exited with $rrc"
-cat "$RESOLVER_OUT"
+tail -n 2000 "$RESOLVER_OUT"
 if [ -z "$RESOLVER_PROGRAM" ] && [ "$rrc" != 0 ] &&
   grep -qiE 'unknown option|unrecognized (option|argument)|invalid (option|argument)|^usage:|error: (unknown|too many|required)' "$RESOLVER_OUT"; then
   err "claude rejected its arguments"
   unresolved "claude rejected its arguments; the resolver never ran (check the claude CLI version)"
 fi
 
-commit_resolved() {
-  if [ "$CONFLICT" = 1 ]; then
+commit_local() {
+  git -C "$WT" add -A -- . ':!SYNC_SUMMARY.md' >/dev/null 2>&1
+  if [ "$CONFLICT" = 1 ] && git -C "$WT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
     git -C "$WT" commit -q -m "🔀 merge: sync upstream $SHORT" \
       -m "Conflicts resolved by an automated Claude Code session; verified by sync.sh." -m "Refs: $TICKET"
   else
     git -C "$WT" commit -q -m "🐛 fix(sync): adapt fork to upstream $SHORT" \
       -m "Applied by an automated Claude Code session; verified by sync.sh." -m "Refs: $TICKET"
   fi
+}
+
+commit_resolved() {
+  commit_local
   attached || precondition "worktree HEAD is not on $BRANCH after commit"
   push_wt "HEAD:refs/heads/$BRANCH" || precondition "push of $BRANCH was rejected"
   [ "$(git -C "$WT" ls-remote origin "refs/heads/$BRANCH" | cut -f1)" = "$(git -C "$WT" rev-parse HEAD)" ] ||
     precondition "origin/$BRANCH does not match the pushed commit"
+}
+
+# Paths the RESOLVER changed, relative to the index snapshot taken before it ran: new paths,
+# paths whose staged blob or mode changed, and paths removed. Conflicted paths (no stage 0 in the
+# snapshot) are the resolver's job and are not listed.
+resolver_touched() {
+  local post
+  post="$(mktemp "$LOG_DIR/.postindex.XXXXXX")"
+  git -C "$WT" ls-files -s >"$post"
+  awk -F'\t' '
+    FNR == NR { split($1, a, " "); if (a[3] == 0) pre[$2] = a[1] " " a[2]; else conf[$2] = 1; next }
+    { split($1, a, " "); cur[$2] = a[1] " " a[2] }
+    END {
+      for (p in cur) if (!(p in conf) && pre[p] != cur[p]) print p
+      for (p in pre) if (!(p in cur) && !(p in conf)) print p
+    }' "$PRE_INDEX" "$post" | sort -u
+  rm -f "$post"
+}
+
+# Paths the resolver was allowed to touch besides the conflicted ones: for a clean merge with red
+# checks, only paths the merge itself brought in; for a conflicted merge, none.
+allowed_extra() {
+  [ "$CONFLICT" = 0 ] && git -C "$WT" diff --name-only "$DH_BASE" "$MERGE_COMMIT"
+  return 0
+}
+
+conflicted_paths() { awk -F'\t' '{ split($1, a, " "); if (a[3] != 0) print $2 }' "$PRE_INDEX" | sort -u; }
+
+# Secret scan of the resolver-authored content (added lines in touched and conflicted paths), run
+# before any push. gitleaks when available (UNVERIFIED offline: "gitleaks stdin --no-banner --redact"
+# exits 1 on a leak; any other non-zero exit falls back to the regex scan), else a regex scan.
+SECRET_RE='(gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,}|ATATT[A-Za-z0-9_=-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|glpat-[A-Za-z0-9_-]{20}|sk-ant-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}|eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.)'
+secrets_found() { # secrets_found <paths-file>: 0 when a secret is found
+  local diff p gl="" rc
+  diff="$(mktemp "$LOG_DIR/.scan.XXXXXX")"
+  while IFS= read -r p; do
+    [ -n "$p" ] && git -C "$WT" diff --cached -U0 --no-renames "$DH_BASE" -- "$p" | grep -E '^\+' | grep -vE '^\+\+\+ ' >>"$diff"
+  done <"$1"
+  case "$GITLEAKS" in
+    none) ;;
+    "") gl="$(command -v gitleaks 2>/dev/null)" ;;
+    *) gl="$GITLEAKS" ;;
+  esac
+  if [ -n "$gl" ]; then
+    "$gl" stdin --no-banner --redact <"$diff" >/dev/null 2>&1
+    rc=$?
+    case "$rc" in
+      0) rm -f "$diff"; return 1 ;;
+      1) rm -f "$diff"; return 0 ;;
+      *) warn "gitleaks exited $rc; falling back to the regex scan" ;;
+    esac
+  fi
+  if grep -qE "$SECRET_RE" "$diff"; then
+    rm -f "$diff"
+    return 0
+  fi
+  rm -f "$diff"
+  return 1
 }
 
 # Never trust the resolver's claim: verify the result ourselves.
@@ -554,14 +688,24 @@ weakening_guard || unresolved "test-weakening guard tripped"
 if [ "$CONFLICT" = 0 ] && git -C "$WT" diff --cached --quiet; then
   unresolved "resolver made no changes"
 fi
+# Only conflicted files (or, for red checks after a clean merge, files the merge brought in) may be
+# resolver-authored; a new or other path means needs-human, and nothing is pushed.
+outside="$(resolver_touched | grep -vxFf <({ allowed_extra; echo; }) | tr '\n' ' ')"
+if [ -n "$outside" ]; then
+  needs_human "resolver changed paths outside the conflicted set: $outside"
+fi
 # Resolver-authored build/test config is never run or auto-landed: checks would execute it.
 cfg="$(config_changes | tr '\n' ' ')"
 if [ -n "$cfg" ]; then
-  warn "resolver changed build/test config: $cfg"
-  commit_resolved
-  notify "AO sync NEEDS HUMAN: resolver changed build/test config ($cfg). Checks were NOT run. Pushed origin/$BRANCH for review; dh/main untouched."
-  finish needs-human 20
+  needs_human "resolver changed build/test config ($cfg); the checks were NOT run"
 fi
+scan_list="$(mktemp "$LOG_DIR/.scanpaths.XXXXXX")"
+{ resolver_touched; conflicted_paths; } | sort -u >"$scan_list"
+if secrets_found "$scan_list"; then
+  rm -f "$scan_list"
+  needs_human "secret scan hit in resolver-authored content"
+fi
+rm -f "$scan_list"
 run_checks || unresolved "checks red after resolver"
 
 commit_resolved

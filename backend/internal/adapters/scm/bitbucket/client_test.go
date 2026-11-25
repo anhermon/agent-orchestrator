@@ -132,6 +132,50 @@ func TestClientNoCredentialsErrorDoesNotCallServer(t *testing.T) {
 	}
 }
 
+// countingSource counts how often the credential source is consulted.
+type countingSource struct{ calls int }
+
+func (s *countingSource) Credentials(context.Context) (Credentials, error) {
+	s.calls++
+	return Credentials{Username: testUser, Token: testToken}, nil
+}
+
+func TestClientMemoizesCredentialsAndClearsThemOn401(t *testing.T) {
+	status := http.StatusOK
+	srv := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	src := &countingSource{}
+	p, err := NewProvider(ProviderOptions{Credentials: src, APIBase: srv.URL + "/2.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		if _, err := p.client.do(ctx, http.MethodGet, "/user", nil, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := p.client.doRaw(ctx, "/user", nil); err != nil {
+		t.Fatal(err)
+	}
+	if src.calls != 1 {
+		t.Fatalf("credential source called %d times for 4 requests, want 1", src.calls)
+	}
+	status = http.StatusUnauthorized
+	if _, err := p.client.do(ctx, http.MethodGet, "/user", nil, nil, nil); !errors.Is(err, ErrAuthFailed) {
+		t.Fatalf("err = %v, want ErrAuthFailed", err)
+	}
+	status = http.StatusOK
+	if _, err := p.client.do(ctx, http.MethodGet, "/user", nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if src.calls != 2 {
+		t.Fatalf("credential source called %d times after a 401, want 2 (cache cleared)", src.calls)
+	}
+}
+
 func TestPaginateFollowsNextAcrossPages(t *testing.T) {
 	var base string
 	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -98,6 +99,8 @@ type clientOptions struct {
 type client struct {
 	http      *http.Client
 	creds     CredentialSource
+	credMu    sync.Mutex
+	credCache *Credentials // first successful resolution; cleared on a 401
 	apiBase   string
 	baseURL   *url.URL
 	userAgent string
@@ -142,8 +145,32 @@ func (c *client) do(ctx context.Context, method, path string, query url.Values, 
 	return c.doURL(ctx, method, full, body, out)
 }
 
-func (c *client) doURL(ctx context.Context, method, fullURL string, body any, out any) (*http.Response, error) {
+// credentials returns the memoized credentials, resolving them on first use. A
+// keychain-backed source would otherwise spawn a process per API call.
+func (c *client) credentials(ctx context.Context) (Credentials, error) {
+	c.credMu.Lock()
+	defer c.credMu.Unlock()
+	if c.credCache != nil {
+		return *c.credCache, nil
+	}
 	creds, err := c.creds.Credentials(ctx)
+	if err != nil {
+		return Credentials{}, err
+	}
+	c.credCache = &creds
+	return creds, nil
+}
+
+// clearCredentials drops the memoized credentials so a rotated token is picked
+// up after the server rejects the old one.
+func (c *client) clearCredentials() {
+	c.credMu.Lock()
+	c.credCache = nil
+	c.credMu.Unlock()
+}
+
+func (c *client) doURL(ctx context.Context, method, fullURL string, body any, out any) (*http.Response, error) {
+	creds, err := c.credentials(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -186,6 +213,7 @@ func (c *client) doURL(ctx context.Context, method, fullURL string, body any, ou
 		}
 		return resp, nil
 	case resp.StatusCode == http.StatusUnauthorized:
+		c.clearCredentials()
 		return resp, fmt.Errorf("%s %s: %w", method, req.URL.Path, newAPIError(resp, raw, ErrAuthFailed))
 	case resp.StatusCode == http.StatusForbidden:
 		return resp, fmt.Errorf("%s %s: %w", method, req.URL.Path, throttleError(newAPIError(resp, raw, ports.ErrSCMForbidden)))
