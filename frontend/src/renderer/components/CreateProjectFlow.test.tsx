@@ -1449,6 +1449,46 @@ describe("CreateProjectFlow project import validation", () => {
 		expect(screen.queryByText("No origin remote")).not.toBeInTheDocument();
 	});
 
+	it.each([
+		["a repo with no remotes", { hasOrigin: false }],
+		["a repo whose origin is bitbucket.org", { hasOrigin: true }],
+		["a repo whose origin is github.com", { hasOrigin: true }],
+	])("continues straight to project creation for %s without a GitHub step", async (_name, root) => {
+		const user = userEvent.setup();
+		bridgeMocks.chooseDirectory.mockResolvedValue("/repo/project");
+		apiMocks.POST.mockResolvedValueOnce({
+			data: projectValidation("/repo/project", { nextStep: "continue", root: { hasCommit: true, requiredActions: [], ...root } }),
+		});
+
+		renderChooseFlow();
+		await openSource(user, "Open a local folder");
+
+		const sheet = await screen.findByTestId("agent-sheet");
+		expect(sheet).toHaveAttribute("data-path", "/repo/project");
+		expect(screen.queryByText("Prepare project")).not.toBeInTheDocument();
+		expect(screen.queryByText(/does not have a GitHub remote/)).not.toBeInTheDocument();
+		expect(screen.queryByRole("button", { name: "Create repository and continue" })).not.toBeInTheDocument();
+	});
+
+	it("does not show the GitHub creation form when only the first commit is missing", async () => {
+		const user = userEvent.setup();
+		bridgeMocks.chooseDirectory.mockResolvedValue("/repo/project");
+		apiMocks.POST.mockResolvedValueOnce({
+			data: projectValidation("/repo/project", {
+				nextStep: "prepare_git",
+				root: { hasCommit: false, hasOrigin: false, requiredActions: ["git_commit"] },
+			}),
+		});
+
+		renderChooseFlow();
+		await openSource(user, "Open a local folder");
+
+		expect(await screen.findByText("Prepare project")).toBeInTheDocument();
+		expect(screen.queryByText(/does not have a GitHub remote/)).not.toBeInTheDocument();
+		expect(screen.queryByLabelText("Owner")).not.toBeInTheDocument();
+		expect(screen.queryByRole("button", { name: "Create repository and continue" })).not.toBeInTheDocument();
+	});
+
 	it("shows a project-with-child-repos warning before agent selection", async () => {
 		const user = userEvent.setup();
 		bridgeMocks.chooseDirectory.mockResolvedValue("/repo/project");

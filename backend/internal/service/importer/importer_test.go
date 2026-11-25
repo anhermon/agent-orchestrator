@@ -215,7 +215,7 @@ func TestValidateProjectImportUnbornRepositoryNeedsCommitAndRemote(t *testing.T)
 	if !result.IsValid || result.NextStep != ImportNextStepPrepareGit || !result.Root.IsRepo || result.Root.HasCommit {
 		t.Fatalf("result = %#v, want unborn repo needing preparation", result)
 	}
-	wantActions(t, result.Root.RequiredActions, []string{GitPreparationActionCommit, GitPreparationActionCreateRemoteRepository})
+	wantActions(t, result.Root.RequiredActions, []string{GitPreparationActionCommit})
 }
 
 func TestValidateProjectImportParentWithChildReposChoosesImportKind(t *testing.T) {
@@ -307,6 +307,90 @@ func TestValidateProjectImportRootWithOriginAndChildReposWarnsProjectImport(t *t
 	}
 }
 
+func TestValidateProjectImportZeroRemotesContinuesWithoutRemoteAction(t *testing.T) {
+	ctx := context.Background()
+	repo := filepath.Join(t.TempDir(), "repo")
+	gitRepoWithCommitNoOrigin(t, repo)
+	svc := New(Deps{Store: newFakeStore()})
+
+	result, err := svc.Validate(ctx, ImportValidationInput{ImportKind: ImportKindProject, Path: repo})
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !result.IsValid || result.NextStep != ImportNextStepContinue {
+		t.Fatalf("result = %#v, want valid continue for a remoteless repo", result)
+	}
+	wantActions(t, result.Root.RequiredActions, []string{})
+}
+
+func TestPrepareGitZeroRemotesExplicitGitHubOptInStillCreatesRemote(t *testing.T) {
+	ctx := context.Background()
+	repo := gitRepoWithCommitWithOrigin(t, t.TempDir(), "")
+	svc := New(Deps{Store: newFakeStore()})
+
+	result, err := svc.PrepareGit(ctx, GitPreparationInput{
+		ImportKind:      ImportKindProject,
+		Path:            repo,
+		ApprovedActions: []string{GitPreparationActionCreateRemoteRepository},
+		RemoteURL:       "https://example.invalid/opt-in.git",
+	})
+	if err != nil {
+		t.Fatalf("PrepareGit: %v", err)
+	}
+	if !result.Validation.Root.HasOrigin {
+		t.Fatalf("validation = %#v, want origin added after explicit opt-in", result.Validation)
+	}
+}
+
+func TestValidateProjectImportBitbucketOriginContinues(t *testing.T) {
+	ctx := context.Background()
+	for _, origin := range []string{"https://bitbucket.org/acme/widgets.git", "git@bitbucket.org:acme/widgets.git"} {
+		repo := gitRepoWithCommitWithOrigin(t, t.TempDir(), origin)
+		svc := New(Deps{Store: newFakeStore()})
+
+		result, err := svc.Validate(ctx, ImportValidationInput{ImportKind: ImportKindProject, Path: repo})
+		if err != nil {
+			t.Fatalf("Validate(%s): %v", origin, err)
+		}
+		if !result.IsValid || result.NextStep != ImportNextStepContinue {
+			t.Fatalf("origin %s: result = %#v, want valid continue", origin, result)
+		}
+		wantActions(t, result.Root.RequiredActions, []string{})
+	}
+}
+
+func TestValidateProjectImportGitHubOriginContinues(t *testing.T) {
+	ctx := context.Background()
+	repo := gitRepoWithCommitWithOrigin(t, t.TempDir(), "https://github.com/acme/widgets.git")
+	svc := New(Deps{Store: newFakeStore()})
+
+	result, err := svc.Validate(ctx, ImportValidationInput{ImportKind: ImportKindProject, Path: repo})
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !result.IsValid || result.NextStep != ImportNextStepContinue {
+		t.Fatalf("result = %#v, want valid continue", result)
+	}
+}
+
+func TestValidateProjectImportNonOriginRemoteKeepsGitHubCreation(t *testing.T) {
+	ctx := context.Background()
+	repo := gitRepoWithCommitWithOrigin(t, t.TempDir(), "")
+	if out, err := exec.Command("git", "-C", repo, "remote", "add", "upstream", "https://example.invalid/up.git").CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v (%s)", err, out)
+	}
+	svc := New(Deps{Store: newFakeStore()})
+
+	result, err := svc.Validate(ctx, ImportValidationInput{ImportKind: ImportKindProject, Path: repo})
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if result.NextStep != ImportNextStepPrepareGit {
+		t.Fatalf("result = %#v, want upstream prepare_git when only a non-origin remote exists", result)
+	}
+	wantActions(t, result.Root.RequiredActions, []string{GitPreparationActionCreateRemoteRepository})
+}
+
 func TestValidateProjectImportRootWithoutOriginAndChildReposDoesNotWarn(t *testing.T) {
 	ctx := context.Background()
 	root := filepath.Join(t.TempDir(), "repo")
@@ -319,8 +403,8 @@ func TestValidateProjectImportRootWithoutOriginAndChildReposDoesNotWarn(t *testi
 	if err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	if !result.IsValid || result.NextStep != ImportNextStepPrepareGit {
-		t.Fatalf("result = %#v, want prepare_git", result)
+	if !result.IsValid || result.NextStep != ImportNextStepContinue {
+		t.Fatalf("result = %#v, want continue for a remoteless root", result)
 	}
 	if result.Warning != "" {
 		t.Fatalf("warning = %q, want none without root origin", result.Warning)
@@ -631,7 +715,7 @@ func TestPrepareGitAddsOnlyMissingOriginToCommittedRepository(t *testing.T) {
 	}
 	svc := New(Deps{Store: newFakeStore()})
 
-	before, err := svc.Validate(ctx, ImportValidationInput{ImportKind: ImportKindProject, Path: repo})
+	before, err := svc.Validate(ctx, ImportValidationInput{ImportKind: ImportKindProject, Path: repo, publishRemote: true})
 	if err != nil {
 		t.Fatalf("Validate: %v", err)
 	}

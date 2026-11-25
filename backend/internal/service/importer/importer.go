@@ -70,6 +70,11 @@ const importGitHubRepositoryConfigKey = "ao.import.githubRepository"
 type ImportValidationInput struct {
 	ImportKind string `json:"importKind" enum:"project,workspace" minLength:"1"`
 	Path       string `json:"path" minLength:"1"`
+
+	// publishRemote is set by PrepareGit when the caller explicitly approved
+	// create_remote_repository. It keeps GitHub creation available as an opt-in
+	// for repos with no remote. Not part of the API body.
+	publishRemote bool
 }
 
 // GitPreparationInput is the body shape for POST /api/v1/imports/prepare-git.
@@ -218,7 +223,14 @@ func (m *Manager) Validate(ctx context.Context, in ImportValidationInput) (Impor
 
 	root := inspectImportRepo(ctx, path)
 	if importKind == ImportKindProject {
-		root.RequiredActions = addProjectRemoteRepositoryAction(root.RequiredActions)
+		if root.IsRepo && !in.publishRemote && importRepoHasNoRemotes(path) {
+			// DH fork: a repo with no remotes at all stays local. Do not force GitHub creation.
+			root.RequiredActions = slices.DeleteFunc(root.RequiredActions, func(action string) bool {
+				return action == GitPreparationActionSetRemote
+			})
+		} else {
+			root.RequiredActions = addProjectRemoteRepositoryAction(root.RequiredActions)
+		}
 		if root.HasOrigin && root.HasCommit && importGitHubPreparationIncomplete(ctx, path) && !slices.Contains(root.RequiredActions, GitPreparationActionCreateRemoteRepository) {
 			root.RequiredActions = append(root.RequiredActions, GitPreparationActionCreateRemoteRepository)
 		}
@@ -289,7 +301,8 @@ func (m *Manager) PrepareGit(ctx context.Context, in GitPreparationInput) (GitPr
 	if importKind != ImportKindProject && importKind != ImportKindWorkspace {
 		return GitPreparationResult{}, apierr.Invalid("UNSUPPORTED_IMPORT_KIND", "Only project and workspace imports are supported.", map[string]any{"importKind": in.ImportKind})
 	}
-	validation, err := m.Validate(ctx, ImportValidationInput{ImportKind: importKind, Path: in.Path})
+	publishRemote := containsAction(in.ApprovedActions, GitPreparationActionCreateRemoteRepository)
+	validation, err := m.Validate(ctx, ImportValidationInput{ImportKind: importKind, Path: in.Path, publishRemote: publishRemote})
 	if err != nil {
 		return GitPreparationResult{}, err
 	}
@@ -330,7 +343,7 @@ preparation:
 			)
 			if actionErr := runGitPreparationAction(ctx, target.Status.RepoPath, action, target.Input); actionErr != nil {
 				events = append(events, GitPreparationEvent{RepoPath: target.Status.RepoPath, Action: action, State: GitPreparationEventError, Error: actionErr.Error()})
-				latest, _ := m.Validate(ctx, ImportValidationInput{ImportKind: importKind, Path: validation.Root.RepoPath})
+				latest, _ := m.Validate(ctx, ImportValidationInput{ImportKind: importKind, Path: validation.Root.RepoPath, publishRemote: publishRemote})
 				if importKind == ImportKindProject && action == GitPreparationActionCreateRemoteRepository && target.Input.GitHubRepository != nil {
 					latest.Root.RequiredActions = []string{GitPreparationActionCreateRemoteRepository}
 					latest.NextStep = ImportNextStepPrepareGit
@@ -343,7 +356,7 @@ preparation:
 			}
 		}
 	}
-	latest, err := m.Validate(ctx, ImportValidationInput{ImportKind: importKind, Path: validation.Root.RepoPath})
+	latest, err := m.Validate(ctx, ImportValidationInput{ImportKind: importKind, Path: validation.Root.RepoPath, publishRemote: publishRemote})
 	if err != nil {
 		return GitPreparationResult{}, err
 	}
@@ -807,6 +820,13 @@ func resolveImportOriginURL(path string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// importRepoHasNoRemotes reports whether the repo has zero configured remotes.
+// A git failure counts as "has remotes" so upstream behavior is kept.
+func importRepoHasNoRemotes(path string) bool {
+	out, err := aoprocess.Command("git", "-C", path, "remote").Output()
+	return err == nil && strings.TrimSpace(string(out)) == ""
 }
 
 func hasUnsupportedImportGitMetadata(path string) bool {
